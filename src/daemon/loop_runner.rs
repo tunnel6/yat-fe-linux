@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use tunnel::EdgeClient;
+use yat_transport::EdgeClient;
 use yat_wireguard::types::RuntimeStatsParams;
 
 use crate::managers::wg::WgStatus;

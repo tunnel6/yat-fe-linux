@@ -11,11 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 # Core modules (from yat-modules submodule)
-yat-wireguard = { path = "../modules/tunnel/wireguard", default-features = false }
-tunnel = { path = "../modules/tunnel/transport", default-features = false }
+yat-wireguard = { path = "../modules/tunnel/wireguard"}
+yat-transport = { path = "../modules/tunnel/transport"}
 # Core modules (private git repos)
-#yat-wireguard = { git = "ssh://git@git.youxiner.com:10022/yat/wireguard-napi-rs.git", default-features = false }
-#tunnel = { git = "ssh://git@git.youxiner.com:10022/yat/tunnel-napi.git", default-features = false }
+#yat-wireguard = { git = "https://git.youxiner.com/yat/wireguard-rs.git", default-features = false }
+#yat-transport = { git = "https://git.youxiner.com/yat/transport-rs.git", default-features = false }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

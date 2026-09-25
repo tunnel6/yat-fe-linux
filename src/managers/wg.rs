@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use tunnel::{
+use yat_transport::{
   EdgeClient, EdgeClientConfig,
   WGGetNetworkResponseData, WGNetworkRuntimeSnapshotData,
 };
@@ -84,11 +84,6 @@ impl WgManager {
   /// Reference to the cert manager.
   pub fn certs(&self) -> &CertManager {
     &self.certs
-  }
-
-  /// Reference to the app config.
-  pub fn config(&self) -> &config::AppConfig {
-    &self.config
   }
 
   // ─── start: full connect flow ───────────────────────────────────────────
