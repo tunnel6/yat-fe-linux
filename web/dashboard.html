@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YAT Linux Client</title>
+  <script src="/tailwindcss.js"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            yat: { 500: '#22c55e', 600: '#16a34a', 700: '#15803d' },
+            surface: { 900: '#18181b', 800: '#1f1f23', 700: '#27272a', 600: '#3f3f46' },
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .status-dot { animation: pulse-dot 2s ease-in-out infinite; }
+    .status-dot.offline { background: #ef4444; animation: none; }
+    .tab-btn.active { color: #22c55e; border-color: #22c55e; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .log-info  { color: #a1a1aa; }
+    .log-warn  { color: #facc15; }
+    .log-error { color: #ef4444; }
+    .card { background: #1f1f23; border-radius: 0.75rem; padding: 1.5rem; border: 1px solid #27272a; }
+    .badge-online  { background: #22c55e22; color: #22c55e; }
+    .badge-offline { background: #ef444422; color: #ef4444; }
+    /* Horizontal key-value row */
+    .kv-row { display: flex; align-items: baseline; gap: 0.5rem; padding: 0.25rem 0; }
+    .kv-label { color: #71717a; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; flex-shrink: 0; }
+    .kv-value { color: #e4e4e7; font-size: 0.875rem; word-break: break-all; }
+  </style>
+</head>
+<body class="bg-surface-900 text-gray-100 min-h-screen">
+  <div class="max-w-5xl mx-auto px-4 py-6">
+
+    <!-- ── Header ─────────────────────────────────────────────────────── -->
+    <div class="flex items-center justify-between mb-6">
+      <div class="flex items-center gap-3">
+        <div class="w-3 h-3 rounded-full bg-yat-500 status-dot" id="status-dot"></div>
+        <h1 class="text-xl font-bold tracking-tight">YAT Linux Client</h1>
+        <span class="text-xs text-zinc-500 font-mono" id="header-member-id"></span>
+      </div>
+      <div class="flex items-center gap-4">
+        <span class="text-xs text-zinc-500" id="refresh-time"></span>
+        <nav class="flex gap-1 border-b border-zinc-700">
+          <button class="tab-btn active px-3 py-1.5 text-sm font-medium border-b-2 border-transparent transition-colors"
+                  data-tab="dashboard">Dashboard</button>
+          <button class="tab-btn px-3 py-1.5 text-sm font-medium border-b-2 border-transparent transition-colors"
+                  data-tab="settings">Settings</button>
+        </nav>
+      </div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════════════ -->
+    <!-- DASHBOARD TAB                                                   -->
+    <!-- ════════════════════════════════════════════════════════════════ -->
+    <div id="tab-dashboard" class="tab-panel active space-y-4">
+
+      <!-- Row: Network Info + Network Status -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <!-- Network Info -->
+        <div class="card">
+          <h2 class="text-sm font-semibold text-zinc-400 mb-3 flex items-center gap-2">
+            <svg class="w-4 h-4 text-yat-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9"/></svg>
+            Network Info
+          </h2>
+          <div class="space-y-1" id="network-info">
+            <p class="text-zinc-500 text-sm">Loading...</p>
+          </div>
+        </div>
+
+        <!-- Network Status -->
+        <div class="card">
+          <h2 class="text-sm font-semibold text-zinc-400 mb-3 flex items-center gap-2">
+            <svg class="w-4 h-4 text-yat-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.636 18.364a9 9 0 010-12.728m12.728 0a9 9 0 010 12.728M9.172 15.828a5 5 0 010-7.072m5.656 0a5 5 0 010 7.072M12 12h.01"/></svg>
+            Network Status
+            <button id="reconnect-btn" class="hidden ml-auto px-2 py-0.5 text-xs bg-yat-500/20 text-yat-500 rounded hover:bg-yat-500/30 transition-colors">
+              Reconnect
+            </button>
+          </h2>
+          <div class="space-y-1" id="network-status">
+            <p class="text-zinc-500 text-sm">Loading...</p>
+          </div>
+          <div id="reconnect-info" class="hidden mt-2 text-xs text-zinc-500"></div>
+        </div>
+      </div>
+
+      <!-- Certificate -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-zinc-400 mb-3 flex items-center gap-2">
+          <svg class="w-4 h-4 text-yat-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+          Certificate
+          <span class="ml-auto text-xs text-zinc-500" id="cert-days"></span>
+          <button id="cert-renew-btn" class="ml-2 px-2 py-0.5 text-xs bg-yat-500/20 text-yat-500 rounded hover:bg-yat-500/30 transition-colors" title="Check / Renew certificate">
+            Renew
+          </button>
+        </h2>
+        <div class="space-y-1" id="cert-info">
+          <p class="text-zinc-500 text-sm">Loading...</p>
+        </div>
+        <div id="cert-renew-result" class="hidden mt-2 text-sm rounded-lg p-2"></div>
+      </div>
+
+      <!-- Peers -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-zinc-400 mb-3 flex items-center gap-2">
+          <svg class="w-4 h-4 text-yat-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+          Peers
+          <span class="ml-auto text-xs text-zinc-500" id="peer-count-badge"></span>
+        </h2>
+        <div class="overflow-x-auto" id="peers-table">
+          <p class="text-zinc-500 text-sm">Loading...</p>
+        </div>
+      </div>
+
+      <!-- Latest Logs -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-zinc-400 mb-3 flex items-center gap-2">
+          <svg class="w-4 h-4 text-yat-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+          Latest Logs
+        </h2>
+        <div class="font-mono text-xs max-h-48 overflow-y-auto space-y-0.5" id="log-list">
+          <p class="text-zinc-500">Loading...</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════════════ -->
+    <!-- SETTINGS TAB                                                    -->
+    <!-- ════════════════════════════════════════════════════════════════ -->
+    <div id="tab-settings" class="tab-panel space-y-4">
+
+      <!-- Edge Connection -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-zinc-400 mb-3 flex items-center gap-2">
+          <svg class="w-4 h-4 text-yat-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2"/></svg>
+          Edge Connection
+        </h2>
+        <div class="space-y-1" id="edge-config">
+          <p class="text-zinc-500 text-sm">Loading...</p>
+        </div>
+      </div>
+
+      <!-- Identity -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-zinc-400 mb-3 flex items-center gap-2">
+          <svg class="w-4 h-4 text-yat-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
+          Identity
+        </h2>
+        <div class="space-y-1" id="identity-config">
+          <p class="text-zinc-500 text-sm">Loading...</p>
+        </div>
+      </div>
+
+      <!-- Import -->
+      <div class="card">
+        <h2 class="text-sm font-semibold text-zinc-400 mb-3 flex items-center gap-2">
+          <svg class="w-4 h-4 text-yat-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+          Import Network Package
+        </h2>
+        <div class="space-y-3">
+          <div id="import-drop" class="border-2 border-dashed border-zinc-600 rounded-lg p-6 text-center hover:border-yat-500 transition-colors cursor-pointer">
+            <p class="text-zinc-400 text-sm mb-2">Drop share.json here or click to select</p>
+            <input type="file" id="import-file" accept=".json" class="hidden">
+            <button id="import-btn" class="mt-2 px-4 py-1.5 bg-yat-500 hover:bg-yat-600 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50" disabled>
+              Import
+            </button>
+          </div>
+          <div id="import-result" class="hidden text-sm rounded-lg p-3"></div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ─── JavaScript ───────────────────────────────────────────────────── -->
+  <script>
+  (function() {
+    const $ = (sel) => document.querySelector(sel);
+    const YAT = '#22c55e';
+
+    // ── Tab switching ──────────────────────────────────────────────────
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        $(`#tab-${btn.dataset.tab}`).classList.add('active');
+        if (btn.dataset.tab === 'settings') loadSettings();
+      });
+    });
+
+    // ── Helpers ────────────────────────────────────────────────────────
+    function kv(label, value) {
+      return `<div class="kv-row"><span class="kv-label">${label}:</span><span class="kv-value">${value || '—'}</span></div>`;
+    }
+    function truncate(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : s; }
+    function timeAgo(iso) {
+      if (!iso) return '—';
+      const d = new Date(iso), now = new Date();
+      const sec = Math.floor((now - d) / 1000);
+      if (sec < 60) return sec + 's ago';
+      if (sec < 3600) return Math.floor(sec / 60) + 'm ago';
+      return Math.floor(sec / 3600) + 'h ago';
+    }
+
+    // ── Dashboard polling (every 5s) ──────────────────────────────────
+    async function refreshDashboard() {
+      try {
+        const [statusRes, peersRes, logsRes, certRes] = await Promise.all([
+          fetch('/api/status').then(r => r.json()),
+          fetch('/api/peers').then(r => r.json()),
+          fetch('/api/logs').then(r => r.json()),
+          fetch('/api/cert').then(r => r.json()),
+        ]);
+
+        // Status dot
+        const dot = $('#status-dot');
+        dot.classList.toggle('offline', !statusRes.connected);
+
+        // Network Info (horizontal label: value)
+        $('#network-info').innerHTML =
+          kv('Network ID', truncate(statusRes.network_id, 24)) +
+          kv('Name', statusRes.network_name) +
+          kv('Subnet', statusRes.subnet) +
+          kv('Address', statusRes.self_address);
+
+        // Header: Member ID (small muted text next to title)
+        const mid = statusRes.member_id;
+        $('#header-member-id').textContent = mid;// ? truncate(mid, 20) : '';
+
+        // Network Status (horizontal label: value)
+        const statusBadge = statusRes.connected
+          ? '<span class="badge-online px-2 py-0.5 rounded-full text-xs font-medium">Connected</span>'
+          : '<span class="badge-offline px-2 py-0.5 rounded-full text-xs font-medium">Disconnected</span>';
+        $('#network-status').innerHTML =
+          kv('Interface', statusRes.interface_name) + 
+          kv('Status', statusBadge) +
+          kv('Peers', statusRes.peer_count) +
+          kv('Last Sync', timeAgo(statusRes.last_sync_at));
+
+        // Reconnect button + info (only when disconnected)
+        const reconnectBtn = $('#reconnect-btn');
+        const reconnectInfo = $('#reconnect-info');
+        if (!statusRes.connected) {
+          reconnectBtn.classList.remove('hidden');
+          if (statusRes.reconnect_at) {
+            const remaining = Math.max(0, Math.floor((new Date(statusRes.reconnect_at) - Date.now()) / 1000));
+            const mins = Math.floor(remaining / 60);
+            const secs = remaining % 60;
+            reconnectInfo.classList.remove('hidden');
+            reconnectInfo.textContent = `Next retry in ${mins}m ${secs}s`;
+          } else {
+            reconnectInfo.classList.add('hidden');
+          }
+        } else {
+          reconnectBtn.classList.add('hidden');
+          reconnectInfo.classList.add('hidden');
+        }
+
+        // Peers (full key, no truncation)
+        const peers = peersRes.peers || [];
+        $('#peer-count-badge').textContent = peers.length + ' online';
+        if (peers.length === 0) {
+          $('#peers-table').innerHTML = '<p class="text-zinc-500 text-sm">No peers connected</p>';
+        } else {
+          let html = '<table class="w-full text-xs"><thead><tr class="text-zinc-500 text-left">';
+          html += '<th class="pb-2 pr-3">Hostname</th><th class="pb-2 pr-3">IP</th><th class="pb-2 pr-3">Endpoint</th><th class="pb-2">Public Key</th></tr></thead><tbody>';
+          peers.forEach(p => {
+            const ep = p.endpoint || '—';
+            html += `<tr class="border-t border-zinc-800">`;
+            html += `<td class="py-1.5 pr-3 text-zinc-200">${p.hostname || '—'}</td>`;
+            html += `<td class="py-1.5 pr-3 text-zinc-300">${p.assigned_ip}</td>`;
+            html += `<td class="py-1.5 pr-3 text-zinc-400">${truncate(ep, 24)}</td>`;
+            html += `<td class="py-1.5 text-zinc-500 font-mono">${p.public_key || '—'}</td>`;
+            html += `</tr>`;
+          });
+          html += '</tbody></table>';
+          $('#peers-table').innerHTML = html;
+        }
+
+        // Certificate (horizontal label: value)
+        if (certRes.error) {
+          $('#cert-info').innerHTML = `<p class="text-red-400 text-sm">${certRes.error}</p>`;
+          $('#cert-days').textContent = '';
+        } else {
+          const c = certRes.cert;
+          const days = c.days_remaining;
+          const daysColor = days === null ? 'text-zinc-400' : days > 30 ? 'text-yat-500' : days > 7 ? 'text-yellow-400' : 'text-red-400';
+          $('#cert-days').innerHTML = days !== null ? `<span class="${daysColor}">${days} days remaining</span>` : '';
+          $('#cert-info').innerHTML =
+            kv('Subject', c.subject) +
+            kv('Issuer', c.issuer) +
+            kv('Valid From', c.not_before) +
+            kv('Expires', c.not_after) +
+            kv('Fingerprint', `<span class="font-mono text-xs">${c.fingerprint}</span>`) +
+            kv('Path', `<span class="text-zinc-500 text-xs">${c.cert_path}</span>`);
+        }
+
+        // Logs
+        const logs = logsRes.logs || [];
+        if (logs.length === 0) {
+          $('#log-list').innerHTML = '<p class="text-zinc-500">No logs yet</p>';
+        } else {
+          $('#log-list').innerHTML = logs.slice().reverse().map(l => {
+            const cls = l.level === 'WARN' ? 'log-warn' : l.level === 'ERROR' ? 'log-error' : 'log-info';
+            return `<div><span class="text-zinc-600">${l.timestamp}</span> <span class="${cls}">${l.level.padEnd(5)}</span> ${l.message}</div>`;
+          }).join('');
+        }
+
+        // Refresh time
+        $('#refresh-time').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+      } catch (e) {
+        console.error('Refresh failed:', e);
+      }
+    }
+
+    // ── Certificate Renew button ──────────────────────────────────────
+    $('#cert-renew-btn').addEventListener('click', async () => {
+      const btn = $('#cert-renew-btn');
+      const result = $('#cert-renew-result');
+      btn.disabled = true;
+      btn.textContent = 'Checking...';
+      try {
+        const res = await fetch('/api/cert/renew', { method: 'POST' }).then(r => r.json());
+        result.classList.remove('hidden');
+        if (res.success) {
+          result.className = 'mt-2 text-sm rounded-lg p-2 bg-green-900/30 text-green-400';
+        } else {
+          result.className = 'mt-2 text-sm rounded-lg p-2 bg-yellow-900/30 text-yellow-400';
+        }
+        result.textContent = res.message;
+      } catch (e) {
+        result.classList.remove('hidden');
+        result.className = 'mt-2 text-sm rounded-lg p-2 bg-red-900/30 text-red-400';
+        result.textContent = 'Failed to check certificate: ' + e.message;
+      }
+      btn.disabled = false;
+      btn.textContent = 'Renew';
+    });
+
+    // ── Settings (loaded on demand) ───────────────────────────────────
+    let settingsLoaded = false;
+    async function loadSettings() {
+      if (settingsLoaded) return;
+      settingsLoaded = true;
+      try {
+        const res = await fetch('/api/config').then(r => r.json());
+        if (!res.edge) {
+          $('#edge-config').innerHTML =
+            '<p class="text-yellow-400 text-sm">⚠ No config loaded. Import a share.json below to get started.</p>';
+          $('#identity-config').innerHTML =
+            kv('Config Path', `<span class="text-zinc-500 text-xs">${res.config_path}</span>`);
+          return;
+        }
+        $('#edge-config').innerHTML =
+          kv('Host', res.edge.host) +
+          kv('Port', res.edge.port) +
+          kv('Edge ID', truncate(res.edge.edge_id || '', 24)) +
+          kv('Server Name', truncate(res.edge.server_name || '', 32));
+        $('#identity-config').innerHTML =
+          kv('User ID', res.identity.user_id) +
+          kv('Device ID', truncate(res.identity.device_id, 24)) +
+          kv('Username', res.identity.username) +
+          kv('Hostname', res.identity.hostname) +
+          kv('Network ID', truncate(res.network_id || '', 20)) +
+          kv('Config Path', `<span class="text-zinc-500 text-xs">${res.config_path}</span>`);
+      } catch (e) {
+        $('#edge-config').innerHTML = '<p class="text-red-400 text-sm">Failed to load config</p>';
+      }
+    }
+
+    // ── Import ────────────────────────────────────────────────────────
+    const dropZone = $('#import-drop');
+    const fileInput = $('#import-file');
+    const importBtn = $('#import-btn');
+    const importResult = $('#import-result');
+    let selectedFile = null;
+
+    dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('border-yat-500'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('border-yat-500'));
+    dropZone.addEventListener('drop', e => {
+      e.preventDefault();
+      dropZone.classList.remove('border-yat-500');
+      if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+
+    function handleFile(file) {
+      selectedFile = file;
+      importBtn.disabled = false;
+      dropZone.querySelector('p').textContent = file.name;
+      importResult.classList.add('hidden');
+    }
+
+    importBtn.addEventListener('click', async () => {
+      if (!selectedFile) return;
+      importBtn.disabled = true;
+      importBtn.textContent = 'Importing...';
+      importResult.classList.remove('hidden');
+      importResult.className = 'text-sm rounded-lg p-3 bg-blue-900/30 text-blue-400';
+      importResult.textContent = 'Importing... Restarting service...';
+      try {
+        const text = await selectedFile.text();
+        const res = await fetch('/api/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: text }),
+        }).then(r => r.json());
+
+        if (res.success) {
+          importResult.className = 'text-sm rounded-lg p-3 bg-green-900/30 text-green-400';
+          importResult.textContent = res.message;
+          // Reset settings cache so next tab open reloads
+          settingsLoaded = false;
+        } else {
+          importResult.className = 'text-sm rounded-lg p-3 bg-red-900/30 text-red-400';
+          importResult.textContent = 'Import failed: ' + res.error;
+        }
+      } catch (e) {
+        importResult.className = 'text-sm rounded-lg p-3 bg-red-900/30 text-red-400';
+        importResult.textContent = 'Import error: ' + e.message;
+      }
+      importBtn.disabled = false;
+      importBtn.textContent = 'Import';
+    });
+
+    // ── Reconnect button ──────────────────────────────────────────────
+    $('#reconnect-btn').addEventListener('click', async () => {
+      const btn = $('#reconnect-btn');
+      btn.disabled = true;
+      btn.textContent = 'Reconnecting...';
+      try {
+        await fetch('/api/reconnect', { method: 'POST' });
+        $('#reconnect-info').classList.remove('hidden');
+        $('#reconnect-info').textContent = 'Reconnect triggered, waiting...';
+      } catch (e) {
+        console.error('Reconnect failed:', e);
+      }
+      btn.disabled = false;
+      btn.textContent = 'Reconnect';
+    });
+
+    // ── Start polling ─────────────────────────────────────────────────
+    refreshDashboard();
+    setInterval(refreshDashboard, 5000);
+  })();
+  </script>
+</body>
+</html>
