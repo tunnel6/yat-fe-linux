@@ -1,0 +1,28 @@
+# ── Package pre-built yat-client binary into Docker image ────────────────────
+# Usage:
+#   # Build for x86_64 (default)
+#   docker build -f Dockerfile.local -t yat-client:local .
+#
+#   # Build for arm64
+#   docker build -f Dockerfile.local --build-arg RUST_TARGET=aarch64-unknown-linux-musl -t yat-client:local .
+#
+#   # Run
+#   docker run --rm -p 9909:9909 yat-client:local
+#   docker run --rm --network host yat-client:local
+#   docker run --rm --network host yat-client:local serve --listen 0.0.0.0:8080
+
+FROM alpine:3.20
+
+ARG RUST_TARGET=x86_64-unknown-linux-musl
+
+RUN apk add --no-cache ca-certificates wireguard-tools
+
+# Copy pre-built binary from local target/<RUST_TARGET>/release/
+COPY target/${RUST_TARGET}/release/yat-client /usr/local/bin/yat-client
+
+# Default listen address (override via: docker run ... yat-client serve --listen 0.0.0.0:8080)
+ENV YAT_LISTEN=0.0.0.0:9909
+EXPOSE 9909
+
+ENTRYPOINT ["yat-client"]
+CMD ["serve"]

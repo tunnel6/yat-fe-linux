@@ -1,0 +1,139 @@
+stages:
+  - build
+  - docker
+
+variables:
+  REGISTRY: registry.cn-beijing.aliyuncs.com
+  IMAGE_NAME: $REGISTRY/pei/yat-fe-linux
+  BUILDER_IMAGE: $REGISTRY/pei/rust-builer:1.98
+
+# ── Reusable before_script blocks (YAML anchors) ────────────────────────────
+.setup_env: &setup_env
+  - |
+    export HOME="${CI_PROJECT_DIR}"
+    export XDG_CACHE_HOME="${CI_PROJECT_DIR}/.cache"
+    mkdir -p "${HOME}" "${XDG_CACHE_HOME}"
+    ulimit -n 8192 || true
+
+.setup_git_auth: &setup_git_auth
+  - |
+    git config --global url."https://gitlab-ci-token:${CI_JOB_TOKEN}@git.youxiner.com/".insteadOf "https://git.youxiner.com/"
+
+# TODO: remove after rebuilding builder image
+.setup_cargo_mirror: &setup_cargo_mirror
+  - |
+    printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n\n[source.rsproxy]\nregistry = "https://rsproxy.cn/crates.io-index"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n\n[registries.rsproxy]\nindex = "https://rsproxy.cn/crates.io-index"\n\n[net]\ngit-fetch-with-cli = true\n' > /usr/local/cargo/config.toml
+
+# TODO: remove after rebuilding builder image (strips unsupported aarch64 linker flag)
+.setup_zig_wrapper: &setup_zig_wrapper
+  - |
+    REAL_ZIG=$(readlink -f /usr/local/bin/zig)
+    printf '#!/bin/sh\nARGS=""\nfor arg in "$@"; do\n  case "$arg" in\n    --fix-cortex-a53-843419*) ;;\n    *) ARGS="$ARGS $arg" ;;\n  esac\ndone\nexec "%s" $ARGS\n' "$REAL_ZIG" > /usr/local/bin/zig
+    chmod +x /usr/local/bin/zig
+
+# ── Shared build template ────────────────────────────────────────────────────
+.build_template: &build_template
+  stage: build
+  image: $BUILDER_IMAGE
+  before_script:
+    - *setup_env
+    - *setup_git_auth
+    - *setup_cargo_mirror
+    - *setup_zig_wrapper
+    - git submodule sync --recursive && git submodule update --init --recursive
+    - rustc --version && cargo --version && zig version && cargo-zigbuild --version
+  script:
+    - |
+      echo "Building yat-client for ${TARGET}..."
+      if [ "${CROSS_COMPILE:-0}" = "1" ]; then
+        rustup target add "${TARGET}"
+        cargo zigbuild --release --bin yat-client --target "${TARGET}"
+      else
+        cargo build --release --bin yat-client
+      fi
+  artifacts:
+    paths:
+      - target/*/release/yat-client
+      - target/release/yat-client
+    expire_in: 1 week
+
+# ── Linux x86_64 gnu ─────────────────────────────────────────────────────────
+build:linux-x86_64-gnu:
+  <<: *build_template
+  variables:
+    TARGET: x86_64-unknown-linux-gnu
+
+# ── Linux x86_64 musl ────────────────────────────────────────────────────────
+build:linux-x86_64-musl:
+  <<: *build_template
+  variables:
+    TARGET: x86_64-unknown-linux-musl
+    CROSS_COMPILE: '1'
+
+# ── Linux arm64 gnu ──────────────────────────────────────────────────────────
+build:linux-arm64-gnu:
+  <<: *build_template
+  variables:
+    TARGET: aarch64-unknown-linux-gnu
+    CROSS_COMPILE: '1'
+
+# ── Linux arm64 musl ─────────────────────────────────────────────────────────
+build:linux-arm64-musl:
+  <<: *build_template
+  variables:
+    TARGET: aarch64-unknown-linux-musl
+    CROSS_COMPILE: '1'
+
+# ── Beta Docker: push on commits to beta branch ──────────────────────────────
+build:beta:
+  stage: docker
+  # tags:
+  #   - docker
+  image: docker:27-dind
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_BUILDKIT: "1"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "beta"
+  before_script:
+    - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin $REGISTRY
+    - docker buildx create --use --name multiarch --driver docker-container || true
+    - docker buildx inspect --bootstrap
+  script:
+    - |
+      docker buildx build \
+        --platform linux/amd64,linux/arm64 \
+        --push \
+        -t $IMAGE_NAME:beta-${CI_COMMIT_SHORT_SHA} \
+        .
+    - echo "✓ Pushed $IMAGE_NAME:beta-${CI_COMMIT_SHORT_SHA}"
+
+# ── Tag Docker: push on git tags ─────────────────────────────────────────────
+build:tag:
+  stage: docker
+  # tags:
+  #   - docker
+  image: docker:27-dind
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_BUILDKIT: "1"
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script:
+    - echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin $REGISTRY
+    - docker buildx create --use --name multiarch --driver docker-container || true
+    - docker buildx inspect --bootstrap
+  script:
+    - |
+      docker buildx build \
+        --platform linux/amd64,linux/arm64 \
+        --push \
+        -t $IMAGE_NAME:${CI_COMMIT_TAG} \
+        .
+    - echo "✓ Pushed $IMAGE_NAME:${CI_COMMIT_TAG}"

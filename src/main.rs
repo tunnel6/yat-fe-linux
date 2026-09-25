@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser)]
-#[command(name = "yat-cli", version, about = "YAT Linux WireGuard client")]
+#[command(name = "yat-client", version, about = "YAT Linux WireGuard client")]
 struct Cli {
   #[command(subcommand)]
   command: Commands,

@@ -1,0 +1,8 @@
+[submodule "modules/tunnel/wireguard"]
+    path = modules/tunnel/wireguard
+    url = ../wireguard-rs.git
+    branch = feature/for-linux-fe
+[submodule "modules/tunnel/transport"]
+    path = modules/tunnel/transport
+    url = ../transport-rs.git
+    branch = feature/for-linux-fe

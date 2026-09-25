@@ -6,16 +6,13 @@ name = "yat-fe-linux"
 version = "0.1.0"
 
 [[bin]]
-name = "yat-cli"
+name = "yat-client"
 path = "src/main.rs"
 
 [dependencies]
-# Core modules (from yat-modules submodule)
-yat-wireguard = { path = "../modules/tunnel/wireguard"}
-yat-transport = { path = "../modules/tunnel/transport"}
-# Core modules (private git repos)
-#yat-wireguard = { git = "https://git.youxiner.com/yat/wireguard-rs.git", default-features = false }
-#yat-transport = { git = "https://git.youxiner.com/yat/transport-rs.git", default-features = false }
+# Core modules (git submodules)
+yat-wireguard = { path = "modules/tunnel/wireguard"}
+yat-transport = { path = "modules/tunnel/transport"}
 
 # CLI
 clap = { version = "4", features = ["derive"] }
