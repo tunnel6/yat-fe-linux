@@ -7,7 +7,9 @@ use axum::{
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
+
+use yat_transport::EdgeClient;
 
 use crate::config::AppConfig;
 use crate::daemon::loop_runner::{LogBuffer, SyncState};
@@ -25,6 +27,8 @@ pub struct AppState {
   pub restart_tx: Arc<tokio::sync::mpsc::Sender<()>>,
   /// Wake up the reconnect loop for manual reconnect.
   pub reconnect_notify: Arc<tokio::sync::Notify>,
+  /// Edge client reference (set after successful Edge connection).
+  pub edge_client: Arc<Mutex<Option<Arc<EdgeClient>>>>,
 }
 
 // ─── Server entry point ─────────────────────────────────────────────────────
@@ -41,6 +45,7 @@ pub async fn start(listen: &str, app_state: AppState) -> Result<()> {
     .route("/api/config", get(api_config))
     .route("/api/import", post(api_import))
     .route("/api/reconnect", post(api_reconnect))
+    .route("/api/address", post(api_update_address))
     .with_state(app_state);
 
   let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -76,6 +81,7 @@ async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     "subnet": s.subnet,
     "member_id": s.member_id,
     "self_address": s.self_address,
+    "hostname": s.hostname,
     "interface_name": s.interface_name,
     "peer_count": s.peer_count,
     "connected": s.connected,
@@ -141,23 +147,31 @@ async fn api_cert_renew(State(state): State<AppState>) -> Json<serde_json::Value
 /// GET /api/config — current config (edge + identity).
 async fn api_config(State(state): State<AppState>) -> Json<serde_json::Value> {
   let config = state.config.lock().await;
+  let sync = state.sync.lock().await;
   match &*config {
-    Some(c) => Json(serde_json::json!({
-      "edge": {
-        "host": c.edge.host,
-        "port": c.edge.port,
-        "edge_id": c.edge.edge_id,
-        "server_name": c.edge.server_name,
-      },
-      "identity": {
-        "user_id": c.identity.user_id,
-        "device_id": c.identity.device_id,
-        "username": c.identity.username,
-        "hostname": c.identity.hostname,
-      },
-      "network_id": c.network_id(),
-      "config_path": crate::config::config_file_path().display().to_string(),
-    })),
+    Some(c) => {
+      let hostname = if sync.hostname.is_empty() {
+        c.identity.hostname.clone()
+      } else {
+        Some(sync.hostname.clone())
+      };
+      Json(serde_json::json!({
+        "edge": {
+          "host": c.edge.host,
+          "port": c.edge.port,
+          "edge_id": c.edge.edge_id,
+          "server_name": c.edge.server_name,
+        },
+        "identity": {
+          "user_id": c.identity.user_id,
+          "device_id": c.identity.device_id,
+          "username": c.identity.username,
+          "hostname": hostname,
+        },
+        "network_id": c.network_id(),
+        "config_path": crate::config::config_file_path().display().to_string(),
+      }))
+    }
     None => Json(serde_json::json!({
       "edge": null,
       "identity": null,
@@ -231,4 +245,53 @@ async fn api_reconnect(State(state): State<AppState>) -> Json<serde_json::Value>
     "success": true,
     "message": "Reconnect triggered. Check status in a few seconds.",
   }))
+}
+
+/// POST /api/address — update this device's IP address in the network.
+///
+/// Accepts JSON body: `{ "new_ip": "10.0.0.5" }`
+/// Calls Edge `update_wg_member` to apply the change server-side.
+async fn api_update_address(
+  State(state): State<AppState>,
+  Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+  let new_ip = match body.get("new_ip").and_then(|v| v.as_str()).map(|s| s.trim().to_string()) {
+    Some(ip) if !ip.is_empty() => ip,
+    _ => return Json(serde_json::json!({ "success": false, "error": "Missing or empty 'new_ip' field" })),
+  };
+
+  let (network_id, member_id) = {
+    let s = state.sync.lock().await;
+    (s.network_id.clone(), s.member_id.clone())
+  };
+  if network_id.is_empty() || member_id.is_empty() {
+    return Json(serde_json::json!({ "success": false, "error": "Not connected to any network" }));
+  }
+
+  let edge_client = {
+    let guard = state.edge_client.lock().await;
+    guard.clone()
+  };
+  let Some(client) = edge_client else {
+    return Json(serde_json::json!({ "success": false, "error": "Edge client not available" }));
+  };
+
+  match client.update_wg_member(&network_id, &member_id, &new_ip, "").await {
+    Ok(resp) if resp.success => {
+      // Update local state so dashboard reflects the new address immediately
+      let mut s = state.sync.lock().await;
+      s.self_address = new_ip.clone();
+      info!("Address updated to {new_ip}");
+      state.logs.lock().await.push("INFO", format!("Address updated to {new_ip}"));
+      Json(serde_json::json!({ "success": true, "message": format!("Address updated to {new_ip}") }))
+    }
+    Ok(_resp) => {
+      warn!("Address update failed: member_id={member_id}, new_ip={new_ip}");
+      Json(serde_json::json!({ "success": false, "error": "Edge rejected the update" }))
+    }
+    Err(e) => {
+      warn!("Address update error: {e}");
+      Json(serde_json::json!({ "success": false, "error": format!("Update failed: {e}") }))
+    }
+  }
 }

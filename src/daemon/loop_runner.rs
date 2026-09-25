@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -6,7 +6,7 @@ use tracing::{info, warn};
 use yat_transport::EdgeClient;
 use yat_wireguard::types::RuntimeStatsParams;
 
-use crate::managers::wg::WgStatus;
+use crate::managers::wg::is_valid_wireguard_key;
 
 /// Maximum number of log entries kept in the ring buffer.
 const LOG_BUFFER_CAP: usize = 200;
@@ -21,6 +21,8 @@ pub struct PeerInfo {
   pub endpoint: String,
   pub public_key: String,
   pub presence_status: u8,
+  /// Epoch millis of last successful WireGuard handshake, or None if unknown.
+  pub last_handshake_at: Option<f64>,
 }
 
 /// A single log entry for the dashboard log viewer.
@@ -39,6 +41,7 @@ pub struct SyncState {
   pub subnet: String,
   pub member_id: String,
   pub self_address: String,
+  pub hostname: String,
   pub interface_name: String,
   pub peer_count: u32,
   pub connected: bool,
@@ -49,23 +52,6 @@ pub struct SyncState {
 }
 
 impl SyncState {
-  /// Build initial SyncState from a WgStatus returned by WgManager::start().
-  pub fn from_wg_status(status: &WgStatus) -> Self {
-    Self {
-      network_id: status.network_id.clone(),
-      network_name: String::new(),
-      subnet: String::new(),
-      member_id: status.member_id.clone(),
-      self_address: status.self_address.clone(),
-      interface_name: status.interface_name.clone(),
-      peer_count: status.peer_count,
-      connected: true,
-      last_sync_at: None,
-      peers: Vec::new(),
-      reconnect_at: None,
-    }
-  }
-
   /// Build an empty SyncState (used when no config / Edge connection is available).
   pub fn empty() -> Self {
     Self {
@@ -74,6 +60,7 @@ impl SyncState {
       subnet: String::new(),
       member_id: String::new(),
       self_address: String::new(),
+      hostname: String::new(),
       interface_name: String::new(),
       peer_count: 0,
       connected: false,
@@ -160,13 +147,14 @@ pub async fn run_sync_loop(
           let peers: Vec<PeerInfo> = snapshot
             .members
             .iter()
-            .filter(|m| !m.is_current_device && !m.public_key.is_empty())
+            .filter(|m| !m.is_current_device && is_valid_wireguard_key(&m.public_key))
             .map(|m| PeerInfo {
               hostname: m.hostname.clone(),
               assigned_ip: m.assigned_ip.clone(),
               endpoint: m.observed_endpoint.clone(),
               public_key: m.public_key.clone(),
               presence_status: m.presence_status,
+              last_handshake_at: None, // enriched below from runtime stats
             })
             .collect();
           let peer_count = peers.len() as u32;
@@ -177,6 +165,12 @@ pub async fn run_sync_loop(
           s.peer_count = peer_count;
           s.peers = peers;
           s.last_sync_at = Some(chrono::Local::now().to_rfc3339());
+          // Update hostname from the snapshot's current device member
+          if let Some(self_member) = snapshot.members.iter().find(|m| m.is_current_device) {
+            if !self_member.hostname.is_empty() {
+              s.hostname = self_member.hostname.clone();
+            }
+          }
           info!("Sync: {peer_count} peers, network healthy.");
           log_buffer.lock().await.push("INFO", format!("Sync: {peer_count} peers, network healthy."));
         }
@@ -191,15 +185,44 @@ pub async fn run_sync_loop(
       }
     }
 
-    // Refresh live stats (non-fatal if unavailable)
+    // Refresh live stats (non-fatal if unavailable) and merge handshake data into peers.
     // Blocking call: must run in spawn_blocking to avoid blocking the worker thread
     let stats_dir = storage_dir.clone();
     let stats_nid = network_id.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    let stats_result = tokio::task::spawn_blocking(move || {
       yat_wireguard::stats::get_runtime_stats(RuntimeStatsParams {
         storage_dir: stats_dir,
         network_id: stats_nid,
       })
     }).await;
+
+    if let Ok(Ok(Some(stats))) = stats_result {
+      // Build a lookup: public_key → last_handshake_at
+      let hs_map: HashMap<String, Option<f64>> = stats
+        .peers
+        .iter()
+        .map(|p| (p.public_key.clone(), p.last_handshake_at))
+        .collect();
+      let mut s = state.lock().await;
+      for peer in s.peers.iter_mut() {
+        if let Some(hs) = hs_map.get(&peer.public_key) {
+          peer.last_handshake_at = *hs;
+        }
+      }
+    } else {
+      // Diagnostic: log why runtime stats are unavailable
+      match &stats_result {
+        Ok(Ok(None)) => {
+          info!("Runtime stats: no live WG interface or applied state found (network={network_id}).");
+        }
+        Ok(Err(e)) => {
+          warn!("Runtime stats error: {e}");
+        }
+        Err(e) => {
+          warn!("Runtime stats spawn_blocking error: {e}");
+        }
+        _ => {}
+      }
+    }
   }
 }

@@ -14,6 +14,8 @@ use std::path::PathBuf;
 pub struct AppConfig {
   pub edge: EdgeConfig,
   pub identity: IdentityConfig,
+  #[serde(default)]
+  pub auth: Option<AuthConfig>,
   pub network: Option<serde_json::Value>,
 }
 
@@ -35,6 +37,17 @@ pub struct IdentityConfig {
   pub username: Option<String>,
   #[serde(default)]
   pub hostname: Option<String>,
+}
+
+/// OAuth credentials for certificate bootstrap.
+///
+/// The Linux CLI uses these to request its own mTLS certificate from the
+/// Edge via `CertRequest`.  This ensures the certificate is bound to the
+/// local deviceId rather than the source device's identity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthConfig {
+  pub oauth_token: String,
+  pub oauth_provider: String,
 }
 
 impl AppConfig {

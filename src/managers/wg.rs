@@ -28,6 +28,25 @@ use yat_wireguard::types::{
   LocalIdentityParams, SyncLocalConfigParams,
 };
 
+// ─── EdgeJoinContext ─────────────────────────────────────────────────────────
+
+/// Intermediate result from [`WgManager::connect_edge`].
+///
+/// Contains everything needed to later apply the WireGuard interface
+/// (or to keep the Edge connection alive for dashboard / sync even when
+/// WG interface creation fails).
+pub struct EdgeJoinContext {
+  pub edge: Arc<EdgeClient>,
+  pub network_id: String,
+  pub storage_dir: String,
+  pub member_id: String,
+  pub self_address: String,
+  pub hostname: String,
+  pub peer_count: u32,
+  pub interface_name: String,
+  snapshot: WGNetworkRuntimeSnapshotData,
+}
+
 use crate::config::{self, DeviceIdentity};
 use crate::managers::cert::CertManager;
 
@@ -64,7 +83,8 @@ impl WgManager {
     })
   }
 
-  /// Access the Edge client (available after `start()`).
+  /// Access the Edge client (available after `start()` or `connect_edge()`).
+  #[allow(dead_code)]
   pub fn edge_client(&self) -> Option<Arc<EdgeClient>> {
     self.edge.clone()
   }
@@ -86,16 +106,19 @@ impl WgManager {
     &self.certs
   }
 
-  // ─── start: full connect flow ───────────────────────────────────────────
+  // ─── connect_edge: Edge connection + network join ──────────────────────
 
-  /// Execute the full connection flow:
+  /// Phase 1 of the connection flow:
   /// 1. Load certs + device identity
   /// 2. EdgeClient → connect (mTLS) → authenticate
   /// 3. Get/create WG identity
   /// 4. Join WG network (if needed)
-  /// 5. Build WG config → sync_local_config
-  /// 6. apply_staged_runtime → create WG interface
-  pub async fn start(&mut self) -> Result<WgStatus> {
+  /// 5. Re-fetch snapshot (post-join)
+  ///
+  /// Returns an [`EdgeJoinContext`] that carries everything the caller needs
+  /// to later apply the WireGuard interface (phase 2) **or** to keep the
+  /// Edge connection alive for dashboard / sync even when WG fails.
+  pub async fn connect_edge(&mut self) -> Result<EdgeJoinContext> {
     let device_identity = config::load_device_identity()?;
     let hostname = config::get_hostname();
     let storage_dir = self.certs.wg_storage_dir();
@@ -123,7 +146,6 @@ impl WgManager {
       preferred_device_id: Some(device_identity.device_id.clone()),
       hostname: Some(hostname.clone()),
     };
-    // Blocking: file I/O + key generation
     let identity = tokio::task::spawn_blocking(move || {
       yat_wireguard::identity::get_or_create_local_identity(id_params)
     })
@@ -168,8 +190,6 @@ impl WgManager {
       assigned_ip
     };
 
-    // Edge returns a bare IP (e.g. "10.24.0.2"); sync_local_config requires CIDR (e.g. "10.24.0.2/24").
-    // Extract the prefix length from the network subnet (e.g. "10.24.0.0/24" → "/24").
     let self_address = if raw_ip.contains('/') {
       raw_ip
     } else {
@@ -180,22 +200,75 @@ impl WgManager {
       format!("{raw_ip}/{prefix}")
     };
 
+    let peers = build_peers_from_snapshot(&snapshot);
+    let peer_count = peers.len() as u32;
+
+    let self_hostname = snapshot.members.iter()
+      .find(|m| m.is_current_device)
+      .map(|m| m.hostname.clone())
+      .unwrap_or_else(|| hostname.clone());
+
+    Ok(EdgeJoinContext {
+      edge: Arc::new(edge),
+      network_id: network_id.to_string(),
+      storage_dir: storage_dir_str,
+      member_id,
+      self_address,
+      hostname: self_hostname,
+      peer_count,
+      interface_name: "yat0".to_string(),
+      snapshot,
+    })
+  }
+
+  // ─── apply_wg: WireGuard interface creation ────────────────────────────
+
+  /// Phase 2: build WG config, stage, and create the OS interface.
+  ///
+  /// Consumes the [`EdgeJoinContext`] from phase 1.  On success also
+  /// persists connection state and prints a summary.
+  pub async fn apply_wg(&mut self, ctx: EdgeJoinContext) -> Result<WgStatus> {
+    let EdgeJoinContext {
+      edge, network_id, storage_dir, member_id, self_address,
+      hostname: _, peer_count: _, interface_name, snapshot,
+    } = ctx;
+
+    let storage_dir_path = Path::new(&storage_dir);
+
     // ── Build peers + WG config ──────────────────────────────────────────
     let peers = build_peers_from_snapshot(&snapshot);
     let peer_count = peers.len() as u32;
-    let interface_name = "yat0".to_string();
+
+    // Re-create identity (we need the private key for config text)
+    let id_params = LocalIdentityParams {
+      storage_dir: storage_dir.clone(),
+      preferred_device_id: None,
+      hostname: None,
+    };
+    let identity = tokio::task::spawn_blocking(move || {
+      yat_wireguard::identity::get_or_create_local_identity(id_params)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))?
+    .map_err(|e| anyhow::anyhow!("Failed to load WG identity: {e}"))?;
 
     info!("Building WireGuard config: {peer_count} peers, subnet={}", snapshot.network.subnet);
     let config_text = build_wg_config_text(&identity.private_key, &self_address, None, &peers);
 
     // ── Stage + Apply ────────────────────────────────────────────────────
-    let network_dir = storage_dir.join("networks").join(&network_id);
+    let network_dir = storage_dir_path.join("networks").join(&network_id);
     std::fs::create_dir_all(&network_dir)?;
     let config_path = network_dir.join("wg.conf");
 
     info!("Syncing WireGuard local config...");
+    // Remove any stale staged state from a previous run to ensure
+    // apply_staged_runtime reads the file we're about to write.
+    let runtime_state_path = network_dir.join("runtime-state.json");
+    if runtime_state_path.exists() {
+      let _ = std::fs::remove_file(&runtime_state_path);
+    }
     let sync_params = SyncLocalConfigParams {
-      storage_dir: storage_dir_str.clone(),
+      storage_dir: storage_dir.clone(),
       network_id: network_id.clone(),
       interface_name: interface_name.clone(),
       config_path: config_path.to_string_lossy().to_string(),
@@ -204,7 +277,6 @@ impl WgManager {
       listen_port: None,
       peers,
     };
-    // Blocking: writes WG config to disk
     tokio::task::spawn_blocking(move || {
       yat_wireguard::staging::sync_local_config(sync_params)
     })
@@ -214,10 +286,9 @@ impl WgManager {
 
     info!("Applying WireGuard runtime (creating interface)...");
     let apply_params = ApplyRuntimeParams {
-      storage_dir: storage_dir_str.clone(),
+      storage_dir: storage_dir.clone(),
       network_id: network_id.clone(),
     };
-    // Blocking: creates utun interface, runs ifconfig, starts boringtun
     let applied = tokio::task::spawn_blocking(move || {
       yat_wireguard::applied::apply_staged_runtime(apply_params)
     })
@@ -233,7 +304,7 @@ impl WgManager {
     // ── Persist state ────────────────────────────────────────────────────
     self.network_id = Some(network_id.clone());
     self.member_id = Some(member_id.clone());
-    self.edge = Some(Arc::new(edge));
+    self.edge = Some(edge);
     save_state(&network_id, &member_id, &self_address, &interface_name, peer_count)?;
 
     let status = WgStatus {
@@ -253,6 +324,18 @@ impl WgManager {
     println!("  Member:    {member_id}");
 
     Ok(status)
+  }
+
+  // ─── start: full connect flow (convenience wrapper) ────────────────────
+
+  /// Execute the full connection flow (phase 1 + phase 2).
+  ///
+  /// Equivalent to calling [`connect_edge`](Self::connect_edge) followed by
+  /// [`apply_wg`](Self::apply_wg).  Used by the manual `yat-cli start`
+  /// command where an all-or-nothing result is expected.
+  pub async fn start(&mut self) -> Result<WgStatus> {
+    let ctx = self.connect_edge().await?;
+    self.apply_wg(ctx).await
   }
 
   // ─── stop: full disconnect flow ─────────────────────────────────────────
@@ -391,45 +474,34 @@ impl WgManager {
     Ok(client)
   }
 
-  /// Resolve network membership: if already joined, return existing member_id;
-  /// otherwise join the network.
+  /// Resolve network membership by (re-)joining the network.
+  ///
+  /// Always sends `join_wg_network` with the real WireGuard public key,
+  /// even when the member is already joined.  The edge's `JoinNetwork`
+  /// handler is idempotent — if the member already exists, it performs a
+  /// public-key upgrade (placeholder → real key) in place.
+  ///
+  /// This avoids a timing issue on first startup where the snapshot
+  /// returned by `get_network` may still contain placeholder public keys
+  /// for other members that haven't connected yet.
   async fn resolve_membership(
     &self,
     edge: &EdgeClient,
     network_id: &str,
     identity: &yat_wireguard::types::LocalIdentity,
     hostname: &str,
-    net_response: &WGGetNetworkResponseData,
+    _net_response: &WGGetNetworkResponseData,
   ) -> Result<(String, String)> {
-    let already_joined = net_response.snapshot.as_ref().and_then(|s| {
-      if s.network.self_joined {
-        Some((s.network.self_member_id.clone(), String::new()))
-      } else {
-        None
-      }
-    });
-
-    match already_joined {
-      Some((mid, _)) => {
-        info!("Already joined network. Member: {mid}");
-        let assigned_ip = net_response.snapshot.as_ref()
-          .and_then(|s| s.members.iter().find(|m| m.is_current_device).map(|m| m.assigned_ip.clone()))
-          .unwrap_or_default();
-        Ok((mid, assigned_ip))
-      }
-      None => {
-        info!("Joining network...");
-        let join_result = edge
-          .join_wg_network(network_id, &identity.client_id, &identity.public_key, hostname)
-          .await
-          .context("Failed to join network")?;
-        if !join_result.success {
-          anyhow::bail!("Join failed: {} (code: {})", join_result.error_message, join_result.error_code);
-        }
-        info!("Joined network. Member: {} IP: {}", join_result.member_id, join_result.assigned_ip);
-        Ok((join_result.member_id, join_result.assigned_ip))
-      }
+    info!("Joining network (sending real public key for upgrade)...");
+    let join_result = edge
+      .join_wg_network(network_id, &identity.client_id, &identity.public_key, hostname)
+      .await
+      .context("Failed to join network")?;
+    if !join_result.success {
+      anyhow::bail!("Join failed: {} (code: {})", join_result.error_message, join_result.error_code);
     }
+    info!("Joined network. Member: {} IP: {}", join_result.member_id, join_result.assigned_ip);
+    Ok((join_result.member_id, join_result.assigned_ip))
   }
 
   /// Best-effort leave via Edge (used during stop).
@@ -551,34 +623,68 @@ fn build_wg_config_text(
   config
 }
 
+/// Returns true if `key` looks like a valid WireGuard public key.
+///
+/// Accepts:
+/// - 44-character base64 (32 bytes encoded with "=" padding)
+/// - 64-character lowercase hex (32 bytes)
+pub(crate) fn is_valid_wireguard_key(key: &str) -> bool {
+  match key.len() {
+    44 => {
+      // Standard base64 alphabet + padding
+      key.as_bytes().iter().all(|&b| {
+        b.is_ascii_uppercase()
+          || b.is_ascii_lowercase()
+          || b.is_ascii_digit()
+          || b == b'+'
+          || b == b'/'
+          || b == b'='
+      })
+    }
+    64 => key.as_bytes().iter().all(|&b| b.is_ascii_hexdigit()),
+    _ => false,
+  }
+}
+
 /// Build peer list from a network snapshot (excludes self).
+///
+/// Members whose `public_key` is empty or not a valid WireGuard key
+/// (e.g. placeholder values like a client-ID or port number) are silently
+/// skipped — they cannot be programmed into the interface.
 fn build_peers_from_snapshot(
   snapshot: &WGNetworkRuntimeSnapshotData,
 ) -> Vec<LocalConfigPeerInput> {
-  snapshot
-    .members
-    .iter()
-    .filter(|m| !m.is_current_device && !m.public_key.is_empty())
-    .map(|m| {
-      let endpoint = if m.observed_endpoint.is_empty() {
-        None
-      } else {
-        Some(m.observed_endpoint.clone())
-      };
-      // Each peer's allowed_ips is its own assigned IP /32, not the whole subnet.
-      let allowed_ip = if m.assigned_ip.contains('/') {
-        m.assigned_ip.clone()
-      } else {
-        format!("{}/32", m.assigned_ip)
-      };
-      LocalConfigPeerInput {
-        member_id: m.member_id.clone(),
-        hostname: Some(m.hostname.clone()),
-        device_id: m.device_id.clone(),
-        public_key: Some(m.public_key.clone()),
-        allowed_ips: vec![allowed_ip],
-        endpoint,
-      }
-    })
-    .collect()
+  let mut peers = Vec::with_capacity(snapshot.members.len());
+  for m in &snapshot.members {
+    if m.is_current_device {
+      continue;
+    }
+    if !is_valid_wireguard_key(&m.public_key) {
+      warn!(
+        "Skipping member {} (device {}): public_key {:?} is not a valid WireGuard key",
+        m.member_id, m.device_id, m.public_key
+      );
+      continue;
+    }
+    let endpoint = if m.observed_endpoint.is_empty() {
+      None
+    } else {
+      Some(m.observed_endpoint.clone())
+    };
+    // Each peer's allowed_ips is its own assigned IP /32, not the whole subnet.
+    let allowed_ip = if m.assigned_ip.contains('/') {
+      m.assigned_ip.clone()
+    } else {
+      format!("{}/32", m.assigned_ip)
+    };
+    peers.push(LocalConfigPeerInput {
+      member_id: m.member_id.clone(),
+      hostname: Some(m.hostname.clone()),
+      device_id: m.device_id.clone(),
+      public_key: Some(m.public_key.clone()),
+      allowed_ips: vec![allowed_ip],
+      endpoint,
+    });
+  }
+  peers
 }

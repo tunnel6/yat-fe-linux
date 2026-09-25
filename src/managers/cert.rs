@@ -74,6 +74,77 @@ impl CertManager {
     }
   }
 
+  /// Check if a client certificate exists on disk.
+  pub fn has_client_cert(&self) -> bool {
+    self.certs_dir().join("client.crt").exists()
+      && self.certs_dir().join("client.key").exists()
+  }
+
+  /// Bootstrap a client certificate from the Edge using OAuth credentials.
+  ///
+  /// Creates a one-way TLS connection (no client cert), sends a `CertRequest`
+  /// with the given OAuth token, and stores the returned certificate + key.
+  /// This is the primary certificate acquisition path for new-format shares.
+  pub async fn bootstrap_certificate(
+    &self,
+    edge_config: &crate::config::EdgeConfig,
+    oauth_token: &str,
+    oauth_provider: &str,
+    user_id: &str,
+    device_id: &str,
+  ) -> Result<()> {
+    use yat_transport::{EdgeClient, EdgeClientConfig};
+
+    let ca_cert = std::fs::read(self.certs_dir().join("ca.crt"))
+      .context("CA certificate not found. Import share.json first.")?;
+
+    let config = EdgeClientConfig {
+      host: edge_config.host.clone(),
+      port: edge_config.port,
+      ca_cert,
+      client_cert: None,
+      client_key: None,
+      heartbeat_interval_secs: 0,
+      quic_keepalive_secs: 0,
+      quic_idle_timeout_secs: 0,
+      edge_id: edge_config.edge_id.clone(),
+      server_name: edge_config.server_name.clone(),
+    };
+
+    let client = EdgeClient::new(config);
+
+    tracing::info!(
+      "Requesting certificate from Edge for device {}...",
+      device_id
+    );
+
+    let result = client
+      .request_certificate(oauth_token, oauth_provider, user_id, device_id)
+      .await
+      .context("Certificate request failed")?;
+
+    // Store the certificate and key
+    let certs_dir = self.certs_dir();
+    std::fs::create_dir_all(&certs_dir)?;
+    std::fs::write(certs_dir.join("client.crt"), &result.certificate)
+      .context("Failed to write client.crt")?;
+    std::fs::write(certs_dir.join("client.key"), &result.private_key)
+      .context("Failed to write client.key")?;
+    // Update CA cert if the response includes one
+    if !result.ca_certificate.is_empty() {
+      std::fs::write(certs_dir.join("ca.crt"), &result.ca_certificate)
+        .context("Failed to write ca.crt")?;
+    }
+
+    tracing::info!(
+      "Certificate obtained and stored (serial: {}, expires: {})",
+      result.serial_number,
+      result.expires_at
+    );
+
+    Ok(())
+  }
+
   /// Directory where WireGuard identity and network state are stored.
   pub fn wg_storage_dir(&self) -> PathBuf {
     self.config_dir.join("wireguard")

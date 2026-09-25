@@ -63,13 +63,21 @@ pub async fn run(listen: &str) -> Result<()> {
     cert_manager: Arc::clone(&cert_manager),
     restart_tx: Arc::new(restart_tx),
     reconnect_notify: Arc::clone(&reconnect_notify),
+    edge_client: Arc::new(Mutex::new(None)),
   };
+  // Pre-clone for the cert rotation monitor (config and cert_manager are
+  // moved into spawned tasks below).
+  let cfg_for_renew = config.clone();
+  let cm_for_restart = Arc::clone(&cert_manager);
+
   if let Some(cfg) = config {
     let ss = Arc::clone(&sync_state);
     let lb = Arc::clone(&log_buffer);
     let rn = Arc::clone(&reconnect_notify);
+    let cm = Arc::clone(&cert_manager);
+    let ec = Arc::clone(&app_state.edge_client);
     tokio::spawn(async move {
-      connect_edge(cfg, ss, lb, rn).await;
+      connect_edge(cfg, ss, lb, rn, cm, ec).await;
     });
   } else {
     log_buffer.lock().await.push("INFO", "No config — import a share.json via Web UI.".into());
@@ -110,18 +118,22 @@ pub async fn run(listen: &str) -> Result<()> {
         let ss = Arc::clone(&ss_restart);
         let lb = Arc::clone(&lb_restart);
         let rn = Arc::new(Notify::new());
+        let cm = Arc::clone(&cm_for_restart);
+        // edge_client is not accessible here — it will be set inside connect_edge
+        // via its own mechanism. For restart, we pass a fresh one.
+        let ec = Arc::new(Mutex::new(None));
         tokio::spawn(async move {
-          connect_edge(cfg, ss, lb, rn).await;
+          connect_edge(cfg, ss, lb, rn, cm, ec).await;
         });
       }
     }
   });
 
-  // 6. Certificate rotation monitor — checks every hour, warns if < 3 days
+  // 6. Certificate rotation monitor — checks every hour, auto-renews with OAuth token
   let cert_mgr = Arc::clone(&cert_manager);
   let lb_cert = Arc::clone(&log_buffer);
   tokio::spawn(async move {
-    cert_rotation_monitor(cert_mgr, lb_cert).await;
+    cert_rotation_monitor(cert_mgr, lb_cert, cfg_for_renew).await;
   });
 
   // 7. Start web server (blocks until shutdown)
@@ -135,13 +147,54 @@ pub async fn run(listen: &str) -> Result<()> {
 /// Implements auto-reconnect with exponential back-off (1→30 s).
 /// After `MAX_RECONNECT_ATTEMPTS` consecutive failures, enters a 30-minute
 /// deferred wait that can be interrupted by the manual reconnect button.
+///
+/// **Key design**: Edge connection and WireGuard interface creation are
+/// decoupled.  When WG creation fails (e.g. invalid peer key), the Edge
+/// client stays alive so the dashboard can keep receiving server-pushed
+/// peer / network updates.
 async fn connect_edge(
   cfg: Arc<AppConfig>,
   sync_state: Arc<Mutex<SyncState>>,
   log_buffer: Arc<Mutex<LogBuffer>>,
   reconnect_notify: Arc<Notify>,
+  cert_manager: Arc<CertManager>,
+  edge_client_slot: Arc<Mutex<Option<Arc<yat_transport::EdgeClient>>>>,
 ) {
   log_buffer.lock().await.push("INFO", "Connecting to Edge...".into());
+
+  // ── Certificate bootstrap ─────────────────────────────────────────
+  // If no client certificate exists and OAuth credentials are available,
+  // request one from the Edge before proceeding.
+  if !cert_manager.has_client_cert() {
+    if let Some(auth) = &cfg.auth {
+      log_buffer.lock().await.push("INFO", "No client cert — bootstrapping via OAuth...".into());
+      let device_id = &cfg.identity.device_id;
+      let user_id = &cfg.identity.user_id;
+      match cert_manager
+        .bootstrap_certificate(
+          &cfg.edge,
+          &auth.oauth_token,
+          &auth.oauth_provider,
+          user_id,
+          device_id,
+        )
+        .await
+      {
+        Ok(()) => {
+          info!("Certificate bootstrap successful.");
+          log_buffer.lock().await.push("INFO", "Certificate obtained from Edge.".into());
+        }
+        Err(e) => {
+          error!("Certificate bootstrap failed: {e}");
+          log_buffer.lock().await.push("ERROR", format!("Cert bootstrap failed: {e}"));
+          return;
+        }
+      }
+    } else {
+      log_buffer.lock().await.push("ERROR", "No client cert and no OAuth token. Re-import share.json.".into());
+      return;
+    }
+  }
 
   // ── Initial connection ──────────────────────────────────────────────
   let mut wg = match WgManager::from_config((*cfg).clone()) {
@@ -153,15 +206,12 @@ async fn connect_edge(
     }
   };
 
-  let (mut network_id, mut storage_dir) = match wg.start().await {
-    Ok(status) => {
-      {
-        let mut s = sync_state.lock().await;
-        *s = SyncState::from_wg_status(&status);
-      }
+  // Phase 1: Edge connection + network join
+  let ctx = match wg.connect_edge().await {
+    Ok(ctx) => {
       log_buffer.lock().await.push("INFO", "Connected to Edge, network joined.".into());
       info!("Edge connection established.");
-      (status.network_id.clone(), wg.certs().wg_storage_dir().to_string_lossy().to_string())
+      ctx
     }
     Err(e) => {
       error!("Edge connection failed: {e}");
@@ -170,8 +220,39 @@ async fn connect_edge(
     }
   };
 
+  // Populate SyncState from edge context — dashboard shows Connected
+  // even before WG interface is created.
+  let mut network_id = ctx.network_id.clone();
+  let mut storage_dir = ctx.storage_dir.clone();
+  {
+    let mut s = sync_state.lock().await;
+    s.network_id = ctx.network_id.clone();
+    s.member_id = ctx.member_id.clone();
+    s.self_address = ctx.self_address.clone();
+    s.hostname = ctx.hostname.clone();
+    s.interface_name = ctx.interface_name.clone();
+    s.peer_count = ctx.peer_count;
+    s.connected = true;
+    s.reconnect_at = None;
+  }
+
+  // Keep a reference to the edge client before apply_wg consumes ctx.
+  // If apply_wg fails, self.edge is never set — this clone is our fallback.
+  let edge_client = Arc::clone(&ctx.edge);
+
+  // Publish edge_client so the web API can use it (e.g. address update)
+  {
+    let mut slot = edge_client_slot.lock().await;
+    *slot = Some(Arc::clone(&edge_client));
+  }
+
+  // Phase 2: WireGuard interface creation (may fail independently)
+  if let Err(e) = wg.apply_wg(ctx).await {
+    warn!("WireGuard interface creation failed (edge stays connected): {e}");
+    log_buffer.lock().await.push("WARN", format!("WG interface failed: {e}"));
+  }
+
   // ── Sync loop (blocks until Edge disconnects) ───────────────────────
-  let edge_client = wg.edge_client().expect("edge client available after start");
   crate::daemon::loop_runner::run_sync_loop(
     edge_client, Arc::clone(&sync_state), Arc::clone(&log_buffer),
     network_id.clone(), storage_dir.clone(),
@@ -204,7 +285,6 @@ async fn connect_edge(
       Err(e) => {
         warn!("Reconnect: WgManager init failed: {e}");
         log_buffer.lock().await.push("ERROR", format!("Reconnect init failed: {e}"));
-        // Interruptible back-off
         if attempt >= MAX_RECONNECT_ATTEMPTS {
           enter_deferred_wait(&sync_state, &log_buffer, &reconnect_notify).await;
           attempt = 0;
@@ -216,48 +296,66 @@ async fn connect_edge(
       }
     };
 
-    match new_wg.start().await {
-      Ok(status) => {
+    // Phase 1: Edge connection + network join
+    let ctx = match new_wg.connect_edge().await {
+      Ok(ctx) => {
         info!("Edge reconnected successfully on attempt #{attempt}.");
         log_buffer.lock().await.push("INFO", "Edge reconnected successfully.".into());
-
-        {
-          let mut s = sync_state.lock().await;
-          *s = SyncState::from_wg_status(&status);
-          s.reconnect_at = None;
-        }
-
-        // Reset for next potential disconnect
-        network_id = status.network_id.clone();
-        storage_dir = new_wg.certs().wg_storage_dir().to_string_lossy().to_string();
-        backoff_secs = 1;
-        attempt = 0;
-
-        // Re-enter sync loop (blocks until next disconnect)
-        let edge_client = new_wg.edge_client().expect("edge client available after start");
-        crate::daemon::loop_runner::run_sync_loop(
-          edge_client, Arc::clone(&sync_state), Arc::clone(&log_buffer),
-          network_id.clone(), storage_dir.clone(),
-        ).await;
+        ctx
       }
       Err(e) => {
         warn!("Reconnect attempt #{attempt} failed: {e}.");
-        log_buffer.lock().await.push("WARN", format!(
-          "Reconnect failed: {e}."
-        ));
+        log_buffer.lock().await.push("WARN", format!("Reconnect failed: {e}."));
 
         if attempt >= MAX_RECONNECT_ATTEMPTS {
-          // Exhausted all attempts — enter 30-minute deferred wait
           enter_deferred_wait(&sync_state, &log_buffer, &reconnect_notify).await;
           attempt = 0;
         } else {
-          // Interruptible back-off
           info!("Backing off {backoff_secs}s before next attempt...");
           interruptible_sleep(backoff_secs, &reconnect_notify).await;
           backoff_secs = (backoff_secs * 2).min(max_backoff);
         }
+        continue;
       }
+    };
+
+    // Update SyncState from edge context
+    network_id = ctx.network_id.clone();
+    storage_dir = ctx.storage_dir.clone();
+    {
+      let mut s = sync_state.lock().await;
+      s.network_id = ctx.network_id.clone();
+      s.member_id = ctx.member_id.clone();
+      s.self_address = ctx.self_address.clone();
+      s.hostname = ctx.hostname.clone();
+      s.interface_name = ctx.interface_name.clone();
+      s.peer_count = ctx.peer_count;
+      s.connected = true;
+      s.reconnect_at = None;
     }
+    backoff_secs = 1;
+    attempt = 0;
+
+    // Keep a reference before apply_wg consumes ctx.
+    let edge_client = Arc::clone(&ctx.edge);
+
+    // Update the shared edge_client slot for web API access
+    {
+      let mut slot = edge_client_slot.lock().await;
+      *slot = Some(Arc::clone(&edge_client));
+    }
+
+    // Phase 2: WireGuard interface creation (non-fatal)
+    if let Err(e) = new_wg.apply_wg(ctx).await {
+      warn!("WireGuard interface creation failed (edge stays connected): {e}");
+      log_buffer.lock().await.push("WARN", format!("WG interface failed: {e}"));
+    }
+
+    // Re-enter sync loop (blocks until next disconnect)
+    crate::daemon::loop_runner::run_sync_loop(
+      edge_client, Arc::clone(&sync_state), Arc::clone(&log_buffer),
+      network_id.clone(), storage_dir.clone(),
+    ).await;
   }
 }
 
@@ -302,19 +400,30 @@ async fn interruptible_sleep(secs: u64, notify: &Arc<Notify>) {
   }
 }
 
-/// Background task: monitor certificate expiry and log warnings.
+/// Background task: monitor certificate expiry and auto-renew with OAuth token.
 ///
-/// Checks every hour. If the certificate is within 3 days of expiry,
-/// logs a warning. This implements the "daily retry" semantics by
-/// checking frequently and advising renewal.
+/// Checks every hour. If the certificate is within 3 days of expiry and
+/// OAuth credentials are available, automatically requests a new certificate
+/// from the Edge.  Falls back to a warning if no OAuth token is configured.
 async fn cert_rotation_monitor(
   cert_manager: Arc<CertManager>,
   log_buffer: Arc<Mutex<LogBuffer>>,
+  config: Option<Arc<AppConfig>>,
 ) {
   loop {
     tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
 
-    if cert_manager.needs_renewal() {
+    if !cert_manager.needs_renewal() {
+      continue;
+    }
+
+    // Try auto-renewal with OAuth token
+    let Some(cfg) = &config else {
+      log_buffer.lock().await.push("WARN", "Certificate expiring but no config available.".into());
+      continue;
+    };
+    let Some(auth) = &cfg.auth else {
+      // Legacy format — no OAuth token, just warn
       match cert_manager.cert_info() {
         Ok(info) => {
           let days = info.days_remaining.unwrap_or(0);
@@ -330,6 +439,30 @@ async fn cert_rotation_monitor(
             "No valid certificate found. Import from desktop app.".into(),
           );
         }
+      }
+      continue;
+    };
+
+    // Auto-renew: request a fresh certificate
+    info!("Certificate nearing expiry — attempting auto-renewal...");
+    log_buffer.lock().await.push("INFO", "Auto-renewing certificate...".into());
+    match cert_manager
+      .bootstrap_certificate(
+        &cfg.edge,
+        &auth.oauth_token,
+        &auth.oauth_provider,
+        &cfg.identity.user_id,
+        &cfg.identity.device_id,
+      )
+      .await
+    {
+      Ok(()) => {
+        info!("Certificate auto-renewal successful.");
+        log_buffer.lock().await.push("INFO", "Certificate renewed successfully.".into());
+      }
+      Err(e) => {
+        warn!("Certificate auto-renewal failed: {e}");
+        log_buffer.lock().await.push("WARN", format!("Cert renewal failed: {e}"));
       }
     }
   }
