@@ -1,7 +1,7 @@
 # yat-fe-linux
 Yat client for linux
 
-YAT Linux Client (`yat-client`) is the native Linux client for the YAT platform. It provides WireGuard networking capabilities and a built-in Web Dashboard for management. Supports both x86_64 and arm64 architectures, deployable via Docker or standalone binary.
+YAT Linux Client (`yat-client`) is the native Linux client for the YAT platform. It provides WireGuard networking capabilities and a built-in Web Dashboard for management. Docker images support amd64, arm64, and armv7; standalone binaries are listed for amd64 and arm64.
 
 ---
 
@@ -15,7 +15,7 @@ docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 9909:9909 \
-  registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
+  ghcr.io/tunnel6/yat-client-linux:latest
 
 # 2. Open the Dashboard in your browser
 #    http://<your-linux-ip>:9909
@@ -40,7 +40,7 @@ In the desktop app, open **Networks** → **Detail** → **Share to CLI** to exp
 | Item | Requirement |
 |------|-------------|
 | **OS** | Linux (x86_64 / aarch64) |
-| **Kernel** | WireGuard support (`wireguard-tools`) |
+| **Kernel** | Host kernel must support WireGuard; load the `wireguard` module on the host if it is not built in or loaded automatically |
 | **Docker** | Docker 20.10+ (when running via Docker) |
 | **Privileges** | `root` or `CAP_NET_ADMIN` (required for WireGuard interface creation) |
 | **Network** | Reachable YAT Edge server (port determined by Edge config) |
@@ -48,8 +48,14 @@ In the desktop app, open **Networks** → **Detail** → **Share to CLI** to exp
 
 ### Additional Docker Permissions
 
+The `wireguard` kernel module belongs to the host, not the container image. If it is not built into or automatically loaded by the host kernel, load it on the host before starting the container:
+
 ```bash
-# WireGuard requires TUN device and network management capabilities
+sudo modprobe wireguard
+```
+
+```bash
+# Required Docker permissions for the TUN interface and route configuration
 --cap-add NET_ADMIN \
 --device /dev/net/tun
 ```
@@ -63,26 +69,26 @@ In the desktop app, open **Networks** → **Detail** → **Share to CLI** to exp
 #### Pull Image
 
 ```bash
-# Pull from Alibaba Cloud Registry (supports amd64 / arm64)
-docker pull registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
+# Pull from GitHub Container Registry (supports amd64 / arm64)
+docker pull ghcr.io/tunnel6/yat-client-linux:latest
 ```
 
 #### Start Container
 
 ```bash
-# Basic start (port mapping mode)
+# Port mapping mode (default Dashboard port: 9909)
 docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 9909:9909 \
-  registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
+  ghcr.io/tunnel6/yat-client-linux:latest
 
-# Host network mode (recommended for better performance)
+# Optional host network mode (shares the host network namespace; omit -p)
 docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   --network host \
-  registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
+  ghcr.io/tunnel6/yat-client-linux:latest
 ```
 
 #### Custom Port
@@ -93,7 +99,7 @@ docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 8080:8080 \
-  registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest \
+  ghcr.io/tunnel6/yat-client-linux:latest \
   yat-client serve --listen 0.0.0.0:8080
 ```
 
@@ -106,7 +112,7 @@ docker run -d --name yat-client \
   --device /dev/net/tun \
   -p 9909:9909 \
   -v ~/.config/yat-cli:/root/.config/yat-cli \
-  registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
+  ghcr.io/tunnel6/yat-client-linux:latest
 ```
 
 #### View Logs
@@ -143,14 +149,14 @@ chmod +x yat-client
 # 1. Import network config (share.json exported from desktop app)
 sudo yat-client import share.json
 
-# 2. Start the daemon (default listen: 0.0.0.0:9090)
+# 2. Start the daemon (default listen: 0.0.0.0:9909)
 sudo yat-client serve
 
 # Or specify a custom listen address
 sudo yat-client serve --listen 0.0.0.0:8080
 
 # 3. Open the Dashboard in your browser
-#    http://<your-linux-ip>:9090
+#    http://<your-linux-ip>:9909
 ```
 
 > **Note**: The `import` and `serve` commands require root privileges to create the WireGuard network interface.
@@ -174,20 +180,20 @@ Example output:
 ```
 Network:    net-xxxxxxxxxxxx
 Member:     member-xxxxxxxx
-Interface:  yat0 (userspace)
+Interface:  yat0 (kernel)
 Address:    10.0.0.5
 Peers:      3
 Connected:  yes
 
 ── WireGuard Engine ──
-Backend:    boringtun
-Interface:  yat0 (userspace)
+Backend:    wireguard
+Interface:  yat0 (kernel)
 Address:    10.0.0.5
 Public key: abcdef1234567890...
 Peers:      3
 
 ── Live Stats ──
-Backend:    boringtun (yat0)
+Backend:    wireguard (yat0)
 Peers:      3
   [server-a] ep=1.2.3.4:51820 rx=12.3MB tx=5.6MB
   [server-b] ep=5.6.7.8:51820 rx=8.1MB tx=3.2MB
@@ -246,14 +252,27 @@ Configuration files are stored in `~/.config/yat-cli/`:
 
 ---
 
+## Release Notes
+
+### v1.0.0
+
+| libc | Architecture | Base image | Platform |
+|------|--------------|------------|----------|
+| musl | amd64 | `alpine:3.20-amd64` | `linux/amd64` |
+| musl | arm64 | `alpine:3.20-arm64` | `linux/arm64` |
+| GNU | amd64 | `debian:bookworm-slim-amd64` | `linux/amd64` |
+| GNU | arm64 | `debian:bookworm-slim-arm64` | `linux/arm64` |
+| GNU | armv7 | `debian:bookworm-slim-armv7` | `linux/arm/v7` |
+
 ## Architecture Support
 
 | Architecture | Docker Image | Binary |
 |-------------|-------------|--------|
 | linux/amd64 (x86_64) | ✅ | ✅ |
 | linux/arm64 (aarch64) | ✅ | ✅ |
+| linux/arm/v7 (armv7) | ✅ | Not listed |
 
-Docker images are based on Alpine 3.20 (musl libc) for minimal footprint.
+Image variants use Alpine 3.20 (musl libc) or Debian Bookworm slim (GNU libc).
 
 ---
 

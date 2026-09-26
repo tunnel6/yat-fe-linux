@@ -1,6 +1,6 @@
 # YAT Linux Client 发布说明
 
-YAT Linux Client (`yat-client`) 是 YAT 平台的 Linux 原生客户端，提供 WireGuard 组网能力与 Web 管理界面。支持 x86_64 / arm64 双架构，可通过 Docker 或二进制文件直接运行。
+YAT Linux Client (`yat-client`) 是 YAT 平台的 Linux 原生客户端，提供 WireGuard 组网能力与 Web 管理界面。Docker 镜像支持 amd64、arm64 和 armv7；独立二进制目前列出 amd64 和 arm64。
 
 ---
 
@@ -14,7 +14,7 @@ docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 9909:9909 \
-  registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
+  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0
 
 # 2. 打开浏览器访问 Dashboard，导入网络配置
 #    http://<your-linux-ip>:9909
@@ -24,7 +24,7 @@ docker run -d --name yat-client \
 ![Dashboard总览](assets/overview.png)
 
 
-> **提示**：也可以从桌面端 (macOS/Windows) 导出 `share.json`，通过 Dashboard 或 CLI 导入。
+> **提示**：也从桌面端 (macOS/Windows) 导出 `share.json`，通过 Dashboard 或 CLI 导入。
 
 ## 导出网络配置
 
@@ -39,7 +39,7 @@ docker run -d --name yat-client \
 | 项目 | 要求 |
 |------|------|
 | **操作系统** | Linux (x86_64 / aarch64) |
-| **内核模块** | WireGuard (`wireguard-tools`) |
+| **内核** | 宿主机内核需支持 WireGuard；若模块未内置或未自动加载，请在宿主机加载 `wireguard` 模块 |
 | **Docker** | Docker 20.10+（Docker 方式运行时需要） |
 | **权限** | `root` 或 `CAP_NET_ADMIN`（创建 WireGuard 网卡需要） |
 | **网络** | 可访问 YAT Edge 服务器（默认端口由 Edge 配置决定） |
@@ -47,8 +47,14 @@ docker run -d --name yat-client \
 
 ### Docker 运行所需的额外权限
 
+`wireguard` 内核模块属于宿主机，不属于容器镜像。如果宿主机内核未内置该模块且不会自动加载，请在宿主机启动容器前执行：
+
 ```bash
-# WireGuard 需要 TUN 设备和网络管理能力
+sudo modprobe wireguard
+```
+
+```bash
+# TUN 网卡和路由配置所需的 Docker 权限
 --cap-add NET_ADMIN \
 --device /dev/net/tun
 ```
@@ -62,26 +68,26 @@ docker run -d --name yat-client \
 #### 拉取镜像
 
 ```bash
-# 从阿里云镜像仓库拉取（支持 amd64 / arm64）
-docker pull registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
+# 从阿里云容器镜像服务拉取（支持 amd64 / arm64 / armv7）
+docker pull registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0
 ```
 
 #### 启动容器
 
 ```bash
-# 基础启动（端口映射模式）
+# 端口映射模式（Dashboard 默认端口：9909）
 docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 9909:9909 \
-  registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
+  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0
 
-# Host network 模式（推荐，性能更好）
+# 可选：Host network 模式（共享宿主机网络命名空间；不要加 -p）
 docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   --network host \
-  registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
+  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0
 ```
 
 #### 自定义端口
@@ -92,7 +98,7 @@ docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 8080:8080 \
-  registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest \
+  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0 \
   yat-client serve --listen 0.0.0.0:8080
 ```
 
@@ -105,7 +111,7 @@ docker run -d --name yat-client \
   --device /dev/net/tun \
   -p 9909:9909 \
   -v ~/.config/yat-cli:/root/.config/yat-cli \
-  registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
+  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0
 ```
 
 #### 查看日志
@@ -142,14 +148,14 @@ chmod +x yat-client
 # 1. 导入网络配置（从桌面端导出的 share.json）
 sudo yat-client import share.json
 
-# 2. 启动守护进程（默认监听 0.0.0.0:9090）
+# 2. 启动守护进程（默认监听 0.0.0.0:9909）
 sudo yat-client serve
 
 # 或指定监听地址
 sudo yat-client serve --listen 0.0.0.0:8080
 
 # 3. 浏览器打开 Dashboard
-#    http://<your-linux-ip>:9090
+#    http://<your-linux-ip>:9909
 ```
 
 > **注意**：`import` 和 `serve` 命令需要 root 权限来创建 WireGuard 网络接口。
@@ -173,20 +179,20 @@ sudo yat-client status
 ```
 Network:    net-xxxxxxxxxxxx
 Member:     member-xxxxxxxx
-Interface:  yat0 (userspace)
+Interface:  yat0 (kernel)
 Address:    10.0.0.5
 Peers:      3
 Connected:  yes
 
 ── WireGuard Engine ──
-Backend:    boringtun
-Interface:  yat0 (userspace)
+Backend:    wireguard
+Interface:  yat0 (kernel)
 Address:    10.0.0.5
 Public key: abcdef1234567890...
 Peers:      3
 
 ── Live Stats ──
-Backend:    boringtun (yat0)
+Backend:    wireguard (yat0)
 Peers:      3
   [server-a] ep=1.2.3.4:51820 rx=12.3MB tx=5.6MB
   [server-b] ep=5.6.7.8:51820 rx=8.1MB tx=3.2MB
@@ -245,14 +251,27 @@ Peers:      3
 
 ---
 
+## 版本说明
+
+### v1.0.0
+
+| libc | 架构 | 基础镜像 | 平台 |
+|------|------|----------|------|
+| musl | amd64 | `alpine:3.20-amd64` | `linux/amd64` |
+| musl | arm64 | `alpine:3.20-arm64` | `linux/arm64` |
+| GNU | amd64 | `debian:bookworm-slim-amd64` | `linux/amd64` |
+| GNU | arm64 | `debian:bookworm-slim-arm64` | `linux/arm64` |
+| GNU | armv7 | `debian:bookworm-slim-armv7` | `linux/arm/v7` |
+
 ## 架构支持
 
 | 架构 | Docker 镜像 | 二进制文件 |
 |------|-------------|-----------|
 | linux/amd64 (x86_64) | ✅ | ✅ |
 | linux/arm64 (aarch64) | ✅ | ✅ |
+| linux/arm/v7 (armv7) | ✅ | 未列出 |
 
-Docker 镜像基于 Alpine 3.20（musl libc），体积极小。
+镜像变体使用 Alpine 3.20（musl libc）或 Debian Bookworm slim（GNU libc）。
 
 ---
 
