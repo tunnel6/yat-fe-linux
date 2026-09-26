@@ -1,3 +1,4 @@
 /target
+/docker-staging
 Cargo.lock
 *.log

@@ -1,26 +1,40 @@
-# ── Package pre-built yat-client binary into Docker image ────────────────────
+# ── Package pre-built binary into Docker image ───────────────────────────────
+# musl (static) → Alpine base    gnu (dynamic) → Debian base
+#
 # Usage:
-#   # Build for x86_64 (default)
-#   docker build -f Dockerfile.local -t yat-client:local .
+#   # musl
+#   docker build -f Dockerfile.local --build-arg VARIANT=musl \
+#     --build-arg RUST_TARGET=x86_64-unknown-linux-musl --platform linux/amd64 -t yat-client:local .
 #
-#   # Build for arm64
-#   docker build -f Dockerfile.local --build-arg RUST_TARGET=aarch64-unknown-linux-musl -t yat-client:local .
+#   # gnu
+#   docker build -f Dockerfile.local --build-arg VARIANT=gnu \
+#     --build-arg RUST_TARGET=x86_64-unknown-linux-gnu --platform linux/amd64 -t yat-client:local .
 #
-#   # Run
-#   docker run --rm -p 9909:9909 yat-client:local
 #   docker run --rm --network host yat-client:local
-#   docker run --rm --network host yat-client:local serve --listen 0.0.0.0:8080
 
-FROM alpine:3.20
+ARG VARIANT=musl
+
+# ── musl → Alpine ────────────────────────────────────────────────────────────
+FROM registry.cn-beijing.aliyuncs.com/pei/alpine:3.20 AS musl-base
+RUN apk add --no-cache ca-certificates wireguard-tools
+
+# ── gnu → Debian slim (glibc) ────────────────────────────────────────────────
+FROM registry.cn-beijing.aliyuncs.com/pei/debian:bookworm-slim AS gnu-base
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates wireguard-tools tzdata && \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone && \
+    apt-get purge -y tzdata && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+ENV TZ=Asia/Shanghai
+
+# ── Final ────────────────────────────────────────────────────────────────────
+FROM ${VARIANT}-base
 
 ARG RUST_TARGET=x86_64-unknown-linux-musl
 
-RUN apk add --no-cache ca-certificates wireguard-tools
-
-# Copy pre-built binary from local target/<RUST_TARGET>/release/
 COPY target/${RUST_TARGET}/release/yat-client /usr/local/bin/yat-client
 
-# Default listen address (override via: docker run ... yat-client serve --listen 0.0.0.0:8080)
 ENV YAT_LISTEN=0.0.0.0:9909
 EXPOSE 9909
 

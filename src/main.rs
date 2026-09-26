@@ -32,7 +32,7 @@ enum Commands {
   /// Run as daemon with web management UI
   Serve {
     /// Listen address for the web UI
-    #[arg(short, long, default_value = "0.0.0.0:9090")]
+    #[arg(short, long, default_value = "0.0.0.0:9909")]
     listen: String,
   },
 }
