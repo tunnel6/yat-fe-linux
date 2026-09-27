@@ -1,34 +1,41 @@
 # ── YAT Client Linux — Unified Build System ──────────────────────────────────
 #
-# Build matrix:
-#   musl (Alpine 3.20)     : amd64  arm64
-#   gnu  (Debian bookworm) : amd64  arm64  armv7
+# Rust build matrix:
+#   musl (Alpine 3.20)     : amd64  arm64          (local build only)
+#   gnu  (Debian bookworm) : amd64  arm64  armv7   (Docker images)
+#
+# Docker images use gnu (Debian) only — musl binaries have segfault issues.
+#
+# Tag layout (TAG=latest):
+#   Per-arch:   yat-client-linux:amd64 | arm64 | arm
+#   Manifest:   yat-client-linux:latest  (amd64 + arm64 + arm)
+#
+# Tag layout (TAG=v1.0.0):
+#   Per-arch:   yat-client-linux:amd64-v1.0.0 | arm64-v1.0.0 | arm-v1.0.0
+#   Manifest:   yat-client-linux:v1.0.0  (amd64 + arm64 + arm)
 #
 # Filter params (default: all):
-#   LIBC=musl|gnu    ARCH=amd64|arm64|armv7
+#   ARCH=amd64|arm64|armv7    (Docker uses gnu only)
 #
 # Examples:
-#   make build                              # all 5 targets
+#   make build                              # all 5 Rust targets
 #   make build LIBC=musl                    # musl: amd64 + arm64
 #   make build ARCH=armv7                   # gnu-armv7 only
-#   make build LIBC=gnu ARCH=amd64          # gnu-amd64 only
-#   make docker                             # all 5 images
-#   make docker LIBC=musl                   # musl images only
-#   make push TAG=v1.0.0                    # all + manifests
-#   make push LIBC=gnu TAG=v1.0.0           # gnu + gnu manifest
+#   make docker                             # 3 gnu images
+#   make docker ARCH=arm64                  # gnu-arm64 only
+#   make push TAG=v1.0.0                    # per-arch + manifest
 #   make release TAG=v1.0.0                 # build + verify + push
 #
 # Shorthand:
 #   make build-musl  =  make build LIBC=musl
-#   make docker-gnu  =  make docker LIBC=gnu
-#   make push-musl   =  make push LIBC=musl
+#   make build-gnu   =  make build LIBC=gnu
 
 .PHONY: all help \
         build build-musl build-gnu \
         verify verify-musl verify-gnu \
-        stage stage-musl stage-gnu \
-        docker docker-musl docker-gnu \
-        push push-musl push-gnu \
+        stage stage-gnu \
+        docker \
+        push \
         release ensure-buildkit clean
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -60,17 +67,11 @@ TOOL_gnu-amd64   := cargo
 TOOL_gnu-arm64   := cargo
 TOOL_gnu-armv7   := cross
 
-# ── Docker image matrix ─────────────────────────────────────────────────────
-#                         musl (Alpine)     gnu (Debian)
-#   amd64  ✓               ✓
-#   arm64  ✓               ✓
-#   armv7  —               ✓
+# ── Docker image matrix (gnu only) ───────────────────────────────────────────
+#   gnu-amd64  gnu-arm64  gnu-armv7
 
-DX_musl := musl-amd64 musl-arm64
-DX_gnu  := gnu-amd64 gnu-arm64 gnu-armv7
+DX_ALL := gnu-amd64 gnu-arm64 gnu-armv7
 
-BASE_musl-amd64  := $(ALIYUN_REG)/alpine:3.20-amd64
-BASE_musl-arm64  := $(ALIYUN_REG)/alpine:3.20-arm64
 BASE_gnu-amd64   := $(ALIYUN_REG)/debian:bookworm-slim-amd64
 BASE_gnu-arm64   := $(ALIYUN_REG)/debian:bookworm-slim-arm64
 BASE_gnu-armv7   := $(ALIYUN_REG)/debian:bookworm-slim-armv7
@@ -89,7 +90,7 @@ else
 endif
 
 RUST_ACTIVE := $(filter $(_libc_pat),$(filter $(_arch_pat),$(ALL_RUST)))
-DX_ACTIVE   := $(filter $(_libc_pat),$(filter $(_arch_pat),$(DX_musl) $(DX_gnu)))
+DX_ACTIVE   := $(filter $(_libc_pat),$(filter $(_arch_pat),$(DX_ALL)))
 
 # Buildkit: pull from Aliyun and tag locally so buildx never hits Docker Hub
 BUILDKIT_SRC := $(ALIYUN_REG)/buildkit:buildx-stable-1
@@ -99,14 +100,20 @@ BUILDKIT_TAG := moby/buildkit:buildx-stable-1
 all: help
 
 help:
-	@echo "Build matrix:"
-	@echo "  musl (Alpine) : amd64  arm64"
-	@echo "  gnu  (Debian) : amd64  arm64  armv7"
+	@echo "Rust build matrix:"
+	@echo "  musl (Alpine) : amd64  arm64        (local build only)"
+	@echo "  gnu  (Debian) : amd64  arm64  armv7 (Docker images)"
 	@echo ""
-	@echo "Params:  LIBC=musl|gnu  ARCH=amd64|arm64|armv7  (default: all)"
+	@echo "Docker: gnu only (musl binaries have segfault issues)"
 	@echo ""
-	@echo "  build|verify|stage|docker|push [LIBC=..] [ARCH=..]"
-	@echo "  build-musl|build-gnu|docker-musl|docker-gnu|push-musl|push-gnu"
+	@echo "Tag layout:"
+	@echo "  TAG=latest   → :amd64 :arm64 :arm + :latest manifest"
+	@echo "  TAG=v1.0.0   → :amd64-v1.0.0 :arm64-v1.0.0 :arm-v1.0.0 + :v1.0.0 manifest"
+	@echo ""
+	@echo "Params:  ARCH=amd64|arm64|armv7  (default: all)"
+	@echo ""
+	@echo "  build|verify|stage|docker|push [ARCH=..]"
+	@echo "  build-musl|build-gnu"
 	@echo "  release TAG=.. | clean"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -117,12 +124,7 @@ build-musl:  ; @$(MAKE) build  LIBC=musl  ARCH=$(ARCH)  TAG=$(TAG)
 build-gnu:   ; @$(MAKE) build  LIBC=gnu   ARCH=$(ARCH)  TAG=$(TAG)
 verify-musl: ; @$(MAKE) verify LIBC=musl  ARCH=$(ARCH)  TAG=$(TAG)
 verify-gnu:  ; @$(MAKE) verify LIBC=gnu   ARCH=$(ARCH)  TAG=$(TAG)
-stage-musl:  ; @$(MAKE) stage  LIBC=musl  ARCH=$(ARCH)  TAG=$(TAG)
 stage-gnu:   ; @$(MAKE) stage  LIBC=gnu   ARCH=$(ARCH)  TAG=$(TAG)
-docker-musl: ; @$(MAKE) docker LIBC=musl  ARCH=$(ARCH)  TAG=$(TAG)
-docker-gnu:  ; @$(MAKE) docker LIBC=gnu   ARCH=$(ARCH)  TAG=$(TAG)
-push-musl:   ; @$(MAKE) push   LIBC=musl  ARCH=$(ARCH)  TAG=$(TAG)
-push-gnu:    ; @$(MAKE) push   LIBC=gnu   ARCH=$(ARCH)  TAG=$(TAG)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Build (Rust binaries)
@@ -173,18 +175,18 @@ docker: stage ensure-buildkit
 		docker buildx create --name yat-builder --driver docker-container --use
 	@docker buildx use yat-builder 2>/dev/null
 	@$(foreach t,$(DX_ACTIVE), \
-		libc=$(firstword $(subst -,$(sp),$(t))); arch=$(lastword $(subst -,$(sp),$(t))); \
-		if [ "$$arch" = "armv7" ]; then plat=linux/arm/v7; else plat=linux/$$arch; fi; \
+		arch=$(lastword $(subst -,$(sp),$(t))); \
 		if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
+		if [ "$$arch" = "armv7" ]; then plat=linux/arm/v7; else plat=linux/$$arch; fi; \
 		base="$(BASE_$(t))"; \
-		tags="-t $(GHCR):latest-$$libc-$$dx -t $(ALIYUN):latest-$$libc-$$dx"; \
+		tags="-t $(GHCR):$$dx -t $(ALIYUN):$$dx"; \
 		if [ "$(TAG)" != "latest" ]; then \
-			tags="$$tags -t $(GHCR):$(TAG)-$$libc-$$dx -t $(ALIYUN):$(TAG)-$$libc-$$dx"; \
+			tags="$$tags -t $(GHCR):$$dx-$(TAG) -t $(ALIYUN):$$dx-$(TAG)"; \
 		fi; \
-		echo ">> buildx build $$plat VARIANT=$$libc BASE=$$base"; \
+		echo ">> buildx build $$plat BASE=$$base"; \
 		eval docker buildx build --load --pull --provenance=false --platform "$$plat" \
-			--build-arg VARIANT=$$libc --build-arg BASE_IMAGE=$$base \
-			$$tags -f Dockerfile.local2 .; \
+			--build-arg VARIANT=gnu --build-arg BASE_IMAGE=$$base \
+			$$tags -f Dockerfile .; \
 	)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -196,62 +198,31 @@ push: stage ensure-buildkit
 		docker buildx create --name yat-builder --driver docker-container --use
 	@docker buildx use yat-builder 2>/dev/null
 	@$(foreach t,$(DX_ACTIVE), \
-		libc=$(firstword $(subst -,$(sp),$(t))); arch=$(lastword $(subst -,$(sp),$(t))); \
-		if [ "$$arch" = "armv7" ]; then plat=linux/arm/v7; else plat=linux/$$arch; fi; \
+		arch=$(lastword $(subst -,$(sp),$(t))); \
 		if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
+		if [ "$$arch" = "armv7" ]; then plat=linux/arm/v7; else plat=linux/$$arch; fi; \
 		base="$(BASE_$(t))"; \
-		ver_tag=""; \
-		if [ "$(TAG)" != "latest" ]; then \
-			ver_tag="-t $(GHCR):$(TAG)-$$libc-$$dx -t $(ALIYUN):$(TAG)-$$libc-$$dx"; \
-		fi; \
-		echo ">> buildx push $$plat VARIANT=$$libc BASE=$$base"; \
+		if [ "$(TAG)" = "latest" ]; then arch_tag=$$dx; else arch_tag=$$dx-$(TAG); fi; \
+		echo ">> buildx push $$plat BASE=$$base"; \
 		eval docker buildx build --pull --provenance=false --platform "$$plat" --push \
-			--build-arg VARIANT=$$libc --build-arg BASE_IMAGE=$$base \
-			$$ver_tag \
-			-t $(GHCR):latest-$$libc-$$dx \
-			-t $(ALIYUN):latest-$$libc-$$dx \
-			-f Dockerfile.local2 .; \
+			--build-arg VARIANT=gnu --build-arg BASE_IMAGE=$$base \
+			-t $(GHCR):$$arch_tag \
+			-t $(ALIYUN):$$arch_tag \
+			-f Dockerfile .; \
 	)
-	@$(foreach libc,musl gnu, \
-		$(if $(filter $(libc)-%,$(DX_ACTIVE)), \
-			echo "=== Manifest $(libc) ==="; \
-			if [ "$(TAG)" != "latest" ]; then \
-				arch_imgs=""; \
-				$(foreach t,$(filter $(libc)-%,$(DX_ACTIVE)), \
-					arch=$(lastword $(subst -,$(sp),$(t))); \
-					if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
-					arch_imgs="$$arch_imgs $(GHCR):$(TAG)-$(libc)-$$dx"; \
-				) \
-				docker buildx imagetools create -t "$(GHCR):$(TAG)-$(libc)" $$arch_imgs; \
-			fi; \
-			latest_imgs=""; \
-			$(foreach t,$(filter $(libc)-%,$(DX_ACTIVE)), \
-				arch=$(lastword $(subst -,$(sp),$(t))); \
-				if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
-				latest_imgs="$$latest_imgs $(GHCR):latest-$(libc)-$$dx"; \
-			) \
-			docker buildx imagetools create -t "$(GHCR):latest-$(libc)" $$latest_imgs; \
-		) \
-	)
-	@$(if $(filter gnu-%,$(DX_ACTIVE)), \
-		echo "=== Manifest all-platform ==="; \
-		if [ "$(TAG)" != "latest" ]; then \
-			ver_imgs=""; \
-			$(foreach t,$(filter gnu-%,$(DX_ACTIVE)), \
-				arch=$(lastword $(subst -,$(sp),$(t))); \
-				if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
-				ver_imgs="$$ver_imgs $(GHCR):$(TAG)-gnu-$$dx"; \
-			) \
-			docker buildx imagetools create -t "$(GHCR):$(TAG)" $$ver_imgs; \
-		fi; \
-		all_imgs=""; \
-		$(foreach t,$(filter gnu-%,$(DX_ACTIVE)), \
-			arch=$(lastword $(subst -,$(sp),$(t))); \
-			if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
-			all_imgs="$$all_imgs $(GHCR):latest-gnu-$$dx"; \
-		) \
-		docker buildx imagetools create -t "$(GHCR):latest" $$all_imgs; \
-	)
+	@echo "=== Multi-arch manifest: $(TAG) ==="; \
+	manifest_imgs=""; \
+	$(foreach t,$(DX_ACTIVE), \
+		arch=$(lastword $(subst -,$(sp),$(t))); \
+		if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
+		if [ "$(TAG)" = "latest" ]; then src_tag=$$dx; else src_tag=$$dx-$(TAG); fi; \
+		manifest_imgs="$$manifest_imgs $(GHCR):$$src_tag"; \
+	) \
+	docker buildx imagetools create -t "$(GHCR):$(TAG)" $$manifest_imgs; \
+	if [ "$(TAG)" != "latest" ]; then \
+		echo "=== Multi-arch manifest: latest ==="; \
+		docker buildx imagetools create -t "$(GHCR):latest" $$manifest_imgs; \
+	fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Release / Buildkit / Clean

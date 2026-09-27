@@ -468,36 +468,90 @@ async fn cert_rotation_monitor(
   }
 }
 
-/// Install an OS-level SIGINT handler using a dedicated thread.
+/// Install an OS-level signal handler using a dedicated thread.
 ///
-/// This spawns a background thread that blocks on `sigwait` for SIGINT.
-/// When Ctrl+C is pressed, the thread receives the signal directly from
-/// the kernel and calls `process::exit(0)` to force-terminate the process.
+/// This spawns a background thread that blocks on `sigwait` for SIGINT
+/// and SIGTERM. When either signal is received, the thread cleans up
+/// the WireGuard interface (yat0) before force-terminating the process.
 ///
 /// This is necessary because `tokio::signal::ctrl_c()` is unreliable under
 /// `sudo` — the signal may not be delivered to the tokio runtime, especially
 /// when background tasks are blocking worker threads.
+///
+/// SIGTERM handling is also required for container environments (Docker),
+/// where `docker stop` and `docker kill` send SIGTERM by default.
 fn start_signal_handler() {
   std::thread::spawn(|| {
     unsafe {
-      // Block SIGINT in the current thread's signal mask.
+      // Block SIGINT and SIGTERM in the process signal mask.
       // New threads inherit the signal mask, so the spawned thread will
-      // also have SIGINT blocked. `sigwait` then atomically unblocks and
-      // waits for the signal.
+      // have both signals blocked. `sigwait` then atomically unblocks and
+      // waits for either signal.
       let mut set: libc::sigset_t = std::mem::zeroed();
       libc::sigemptyset(&mut set);
       libc::sigaddset(&mut set, libc::SIGINT);
+      libc::sigaddset(&mut set, libc::SIGTERM);
       libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
 
-      // Block until SIGINT is received
+      // Block until SIGINT or SIGTERM is received
       let mut sig: libc::c_int = 0;
       libc::sigwait(&set, &mut sig);
+
+      eprintln!("\nShutting down.");
+
+      // Clean up WireGuard interface before exiting.
+      // `process::exit(0)` does NOT run Drop destructors, so we must
+      // explicitly remove the yat0 interface here.
+      perform_shutdown_cleanup();
 
       // Force-exit immediately. Background tasks (sync loop, reconnect,
       // cert monitor) may hold blocking resources and never respond to
       // cancellation. `process::exit(0)` terminates without waiting.
-      eprintln!("\nShutting down.");
       std::process::exit(0);
     }
   });
+}
+
+/// Clean up the WireGuard interface (yat0) before process exit.
+///
+/// Reads the persisted `state.json` to find the `network_id` and
+/// `storage_dir`, then calls `clear_network_state` which runs
+/// `ip link del yat0` to remove the interface.
+///
+/// This is necessary because `process::exit(0)` skips all Rust `Drop`
+/// destructors, so the interface would otherwise be left behind.
+fn perform_shutdown_cleanup() {
+  // Read state.json to get network_id
+  let state_path = crate::config::config_dir().join("state.json");
+  let state_content = match std::fs::read_to_string(&state_path) {
+    Ok(c) => c,
+    Err(_) => return, // No state file — no WG interface to clean up
+  };
+  let state: serde_json::Value = match serde_json::from_str(&state_content) {
+    Ok(v) => v,
+    Err(_) => return,
+  };
+
+  let network_id = match state.get("network_id").and_then(|v| v.as_str()) {
+    Some(s) if !s.is_empty() => s.to_string(),
+    _ => return,
+  };
+
+  let storage_dir = crate::config::config_dir()
+    .join("wireguard")
+    .to_string_lossy()
+    .to_string();
+
+  eprintln!("Cleaning up WireGuard interface...");
+  match yat_wireguard::runtime::clear_network_state(ClearNetworkStateParams {
+    storage_dir,
+    network_id,
+  }) {
+    Ok(r) if r.removed => eprintln!("WireGuard interface removed."),
+    Ok(_) => {} // No state found — interface already gone
+    Err(e) => eprintln!("Warning: WG cleanup failed: {e}"),
+  }
+
+  // Remove stale state file
+  let _ = std::fs::remove_file(&state_path);
 }

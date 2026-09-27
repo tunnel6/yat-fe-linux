@@ -31,8 +31,8 @@ enum Commands {
   CertInfo,
   /// Run as daemon with web management UI
   Serve {
-    /// Listen address for the web UI
-    #[arg(short, long, default_value = "0.0.0.0:9909")]
+    /// Listen address for the web UI (env: YAT_LISTEN)
+    #[arg(short, long, env = "YAT_LISTEN", default_value = "0.0.0.0:9909")]
     listen: String,
   },
 }

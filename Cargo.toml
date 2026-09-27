@@ -15,7 +15,7 @@ yat-wireguard = { path = "modules/tunnel/wireguard"}
 yat-transport = { path = "modules/tunnel/transport"}
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 
 # Async runtime
