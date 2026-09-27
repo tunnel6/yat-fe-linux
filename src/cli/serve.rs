@@ -87,6 +87,7 @@ pub async fn run(listen: &str) -> Result<()> {
   let ss_restart = Arc::clone(&sync_state);
   let lb_restart = Arc::clone(&log_buffer);
   let cfg_restart = Arc::clone(&config_mutex);
+  let ec_restart = Arc::clone(&app_state.edge_client);
   tokio::spawn(async move {
     while restart_rx.recv().await.is_some() {
       info!("Restart triggered — reloading config and reconnecting...");
@@ -119,9 +120,9 @@ pub async fn run(listen: &str) -> Result<()> {
         let lb = Arc::clone(&lb_restart);
         let rn = Arc::new(Notify::new());
         let cm = Arc::clone(&cm_for_restart);
-        // edge_client is not accessible here — it will be set inside connect_edge
-        // via its own mechanism. For restart, we pass a fresh one.
-        let ec = Arc::new(Mutex::new(None));
+        // Reuse the same edge_client_slot so the web API (e.g. /api/address)
+        // can access the new EdgeClient after reconnection.
+        let ec = Arc::clone(&ec_restart);
         tokio::spawn(async move {
           connect_edge(cfg, ss, lb, rn, cm, ec).await;
         });
@@ -239,6 +240,8 @@ async fn connect_edge(
   // Keep a reference to the edge client before apply_wg consumes ctx.
   // If apply_wg fails, self.edge is never set — this clone is our fallback.
   let edge_client = Arc::clone(&ctx.edge);
+  let client_id = ctx.client_id.clone();
+  let self_address = ctx.self_address.clone();
 
   // Publish edge_client so the web API can use it (e.g. address update)
   {
@@ -251,6 +254,16 @@ async fn connect_edge(
     warn!("WireGuard interface creation failed (edge stays connected): {e}");
     log_buffer.lock().await.push("WARN", format!("WG interface failed: {e}"));
   }
+
+  // Subscribe to P2P events (gather/punch) for same-NAT LAN discovery.
+  // Must be AFTER apply_wg so the WG interface (and its listen port) exists
+  // when a gather event arrives.  Edge may send gather immediately after
+  // the network join response, so we subscribe as soon as the interface is up.
+  crate::gather::subscribe_p2p_events(
+    Arc::clone(&edge_client), client_id.clone(),
+    storage_dir.clone(), network_id.clone(),
+    self_address.clone(),
+  ).await;
 
   // ── Sync loop (blocks until Edge disconnects) ───────────────────────
   crate::daemon::loop_runner::run_sync_loop(
@@ -338,6 +351,8 @@ async fn connect_edge(
 
     // Keep a reference before apply_wg consumes ctx.
     let edge_client = Arc::clone(&ctx.edge);
+    let client_id = ctx.client_id.clone();
+    let self_address = ctx.self_address.clone();
 
     // Update the shared edge_client slot for web API access
     {
@@ -350,6 +365,13 @@ async fn connect_edge(
       warn!("WireGuard interface creation failed (edge stays connected): {e}");
       log_buffer.lock().await.push("WARN", format!("WG interface failed: {e}"));
     }
+
+    // Subscribe to P2P events AFTER WG interface creation (see initial connection comment).
+    crate::gather::subscribe_p2p_events(
+      Arc::clone(&edge_client), client_id.clone(),
+      storage_dir.clone(), network_id.clone(),
+      self_address.clone(),
+    ).await;
 
     // Re-enter sync loop (blocks until next disconnect)
     crate::daemon::loop_runner::run_sync_loop(
@@ -481,17 +503,16 @@ async fn cert_rotation_monitor(
 /// SIGTERM handling is also required for container environments (Docker),
 /// where `docker stop` and `docker kill` send SIGTERM by default.
 fn start_signal_handler() {
+  // SIGINT and SIGTERM are already blocked in main() BEFORE the tokio
+  // runtime was created.  All threads (including tokio workers) inherited
+  // the blocked mask.  This sigwait thread is the ONLY thread that can
+  // catch these signals.
   std::thread::spawn(|| {
     unsafe {
-      // Block SIGINT and SIGTERM in the process signal mask.
-      // New threads inherit the signal mask, so the spawned thread will
-      // have both signals blocked. `sigwait` then atomically unblocks and
-      // waits for either signal.
       let mut set: libc::sigset_t = std::mem::zeroed();
       libc::sigemptyset(&mut set);
       libc::sigaddset(&mut set, libc::SIGINT);
       libc::sigaddset(&mut set, libc::SIGTERM);
-      libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
 
       // Block until SIGINT or SIGTERM is received
       let mut sig: libc::c_int = 0;

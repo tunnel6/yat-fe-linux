@@ -6,7 +6,7 @@ use tracing::{info, warn};
 use yat_transport::EdgeClient;
 use yat_wireguard::types::RuntimeStatsParams;
 
-use crate::managers::wg::is_valid_wireguard_key;
+use crate::managers::wg::{extract_public_ip, is_valid_wireguard_key};
 
 /// Maximum number of log entries kept in the ring buffer.
 const LOG_BUFFER_CAP: usize = 200;
@@ -144,17 +144,47 @@ pub async fn run_sync_loop(
     match edge_client.request_wg_get_network(&network_id).await {
       Ok(response) if response.success => {
         if let Some(snapshot) = response.snapshot {
+          // Build same-NAT LAN endpoint lookup for dashboard display.
+          let self_observed_ip = snapshot
+            .members
+            .iter()
+            .find(|m| m.is_current_device)
+            .map(|m| extract_public_ip(&m.observed_endpoint))
+            .unwrap_or_default();
+          let lan_map: std::collections::HashMap<&str, &str> = snapshot
+            .lan_peer_endpoints
+            .iter()
+            .map(|ep| (ep.public_key.as_str(), ep.lan_endpoint.as_str()))
+            .collect();
+
           let peers: Vec<PeerInfo> = snapshot
             .members
             .iter()
             .filter(|m| !m.is_current_device && is_valid_wireguard_key(&m.public_key))
-            .map(|m| PeerInfo {
-              hostname: m.hostname.clone(),
-              assigned_ip: m.assigned_ip.clone(),
-              endpoint: m.observed_endpoint.clone(),
-              public_key: m.public_key.clone(),
-              presence_status: m.presence_status,
-              last_handshake_at: None, // enriched below from runtime stats
+            .map(|m| {
+              // Same-NAT: prefer LAN endpoint for display.
+              let peer_ip = extract_public_ip(&m.observed_endpoint);
+              let is_same_nat = !self_observed_ip.is_empty()
+                && !peer_ip.is_empty()
+                && self_observed_ip == peer_ip;
+              let lan_ep = if is_same_nat {
+                lan_map.get(m.public_key.as_str()).copied().unwrap_or("")
+              } else {
+                ""
+              };
+              let display_endpoint = if !lan_ep.is_empty() {
+                lan_ep.to_string()
+              } else {
+                m.observed_endpoint.clone()
+              };
+              PeerInfo {
+                hostname: m.hostname.clone(),
+                assigned_ip: m.assigned_ip.clone(),
+                endpoint: display_endpoint,
+                public_key: m.public_key.clone(),
+                presence_status: m.presence_status,
+                last_handshake_at: None, // enriched below from runtime stats
+              }
             })
             .collect();
           let peer_count = peers.len() as u32;
@@ -185,43 +215,28 @@ pub async fn run_sync_loop(
       }
     }
 
-    // Refresh live stats (non-fatal if unavailable) and merge handshake data into peers.
-    // Blocking call: must run in spawn_blocking to avoid blocking the worker thread
-    let stats_dir = storage_dir.clone();
-    let stats_nid = network_id.clone();
+    // Refresh live handshake stats via submodule's `wg show <iface> dump` parser.
+    let sdir = storage_dir.clone();
+    let nid = network_id.clone();
     let stats_result = tokio::task::spawn_blocking(move || {
       yat_wireguard::stats::get_runtime_stats(RuntimeStatsParams {
-        storage_dir: stats_dir,
-        network_id: stats_nid,
+        storage_dir: sdir,
+        network_id: nid,
       })
     }).await;
 
     if let Ok(Ok(Some(stats))) = stats_result {
-      // Build a lookup: public_key → last_handshake_at
+      // Build lookup: public_key → last_handshake epoch millis
       let hs_map: HashMap<String, Option<f64>> = stats
         .peers
-        .iter()
-        .map(|p| (p.public_key.clone(), p.last_handshake_at))
+        .into_iter()
+        .map(|p| (p.public_key, p.last_handshake_at))
         .collect();
       let mut s = state.lock().await;
       for peer in s.peers.iter_mut() {
-        if let Some(hs) = hs_map.get(&peer.public_key) {
-          peer.last_handshake_at = *hs;
+        if let Some(Some(hs)) = hs_map.get(&peer.public_key) {
+          peer.last_handshake_at = Some(*hs);
         }
-      }
-    } else {
-      // Diagnostic: log why runtime stats are unavailable
-      match &stats_result {
-        Ok(Ok(None)) => {
-          info!("Runtime stats: no live WG interface or applied state found (network={network_id}).");
-        }
-        Ok(Err(e)) => {
-          warn!("Runtime stats error: {e}");
-        }
-        Err(e) => {
-          warn!("Runtime stats spawn_blocking error: {e}");
-        }
-        _ => {}
       }
     }
   }

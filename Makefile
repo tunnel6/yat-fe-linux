@@ -36,7 +36,7 @@
         stage stage-gnu \
         docker \
         push \
-        release ensure-buildkit clean
+        release clean
 
 # ── Configuration ────────────────────────────────────────────────────────────
 empty :=
@@ -91,10 +91,6 @@ endif
 
 RUST_ACTIVE := $(filter $(_libc_pat),$(filter $(_arch_pat),$(ALL_RUST)))
 DX_ACTIVE   := $(filter $(_libc_pat),$(filter $(_arch_pat),$(DX_ALL)))
-
-# Buildkit: pull from Aliyun and tag locally so buildx never hits Docker Hub
-BUILDKIT_SRC := $(ALIYUN_REG)/buildkit:buildx-stable-1
-BUILDKIT_TAG := moby/buildkit:buildx-stable-1
 
 # ── Default ──────────────────────────────────────────────────────────────────
 all: help
@@ -170,10 +166,7 @@ stage: verify
 # Docker (local build, --load)
 # ══════════════════════════════════════════════════════════════════════════════
 
-docker: stage ensure-buildkit
-	@docker buildx inspect yat-builder >/dev/null 2>&1 || \
-		docker buildx create --name yat-builder --driver docker-container --use
-	@docker buildx use yat-builder 2>/dev/null
+docker: stage ensure-builder
 	@$(foreach t,$(DX_ACTIVE), \
 		arch=$(lastword $(subst -,$(sp),$(t))); \
 		if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
@@ -184,7 +177,7 @@ docker: stage ensure-buildkit
 			tags="$$tags -t $(GHCR):$$dx-$(TAG) -t $(ALIYUN):$$dx-$(TAG)"; \
 		fi; \
 		echo ">> buildx build $$plat BASE=$$base"; \
-		eval docker buildx build --load --pull --provenance=false --platform "$$plat" \
+		eval docker buildx build --load --platform "$$plat" \
 			--build-arg VARIANT=gnu --build-arg BASE_IMAGE=$$base \
 			$$tags -f Dockerfile .; \
 	)
@@ -193,35 +186,49 @@ docker: stage ensure-buildkit
 # Push (buildx --push + multi-arch manifest)
 # ══════════════════════════════════════════════════════════════════════════════
 
-push: stage ensure-buildkit
-	@docker buildx inspect yat-builder >/dev/null 2>&1 || \
-		docker buildx create --name yat-builder --driver docker-container --use
-	@docker buildx use yat-builder 2>/dev/null
+push: stage ensure-builder
+	@# ── Step 1: buildx build & push to GHCR only ──
 	@$(foreach t,$(DX_ACTIVE), \
 		arch=$(lastword $(subst -,$(sp),$(t))); \
 		if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
 		if [ "$$arch" = "armv7" ]; then plat=linux/arm/v7; else plat=linux/$$arch; fi; \
 		base="$(BASE_$(t))"; \
 		if [ "$(TAG)" = "latest" ]; then arch_tag=$$dx; else arch_tag=$$dx-$(TAG); fi; \
-		echo ">> buildx push $$plat BASE=$$base"; \
+		echo ">> buildx push $$plat → GHCR BASE=$$base"; \
 		eval docker buildx build --pull --provenance=false --platform "$$plat" --push \
 			--build-arg VARIANT=gnu --build-arg BASE_IMAGE=$$base \
 			-t $(GHCR):$$arch_tag \
-			-t $(ALIYUN):$$arch_tag \
 			-f Dockerfile .; \
 	)
-	@echo "=== Multi-arch manifest: $(TAG) ==="; \
-	manifest_imgs=""; \
+	@# ── Step 2: skopeo copy GHCR → Aliyun (per-arch) ──
+	@echo "=== skopeo sync GHCR → Aliyun ==="; \
+	$(foreach t,$(DX_ACTIVE), \
+		arch=$(lastword $(subst -,$(sp),$(t))); \
+		if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
+		if [ "$(TAG)" = "latest" ]; then arch_tag=$$dx; else arch_tag=$$dx-$(TAG); fi; \
+		echo "  $(GHCR):$$arch_tag → $(ALIYUN):$$arch_tag"; \
+		skopeo copy --all \
+			docker://$(GHCR):$$arch_tag \
+			docker://$(ALIYUN):$$arch_tag; \
+	)
+	@# ── Step 3: multi-arch manifest (both registries) ──
+	@echo "=== Multi-arch manifest (GHCR): $(TAG) ==="; \
+	ghcr_imgs=""; \
+	aliyun_imgs=""; \
 	$(foreach t,$(DX_ACTIVE), \
 		arch=$(lastword $(subst -,$(sp),$(t))); \
 		if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
 		if [ "$(TAG)" = "latest" ]; then src_tag=$$dx; else src_tag=$$dx-$(TAG); fi; \
-		manifest_imgs="$$manifest_imgs $(GHCR):$$src_tag"; \
+		ghcr_imgs="$$ghcr_imgs $(GHCR):$$src_tag"; \
+		aliyun_imgs="$$aliyun_imgs $(ALIYUN):$$src_tag"; \
 	) \
-	docker buildx imagetools create -t "$(GHCR):$(TAG)" $$manifest_imgs; \
+	docker buildx imagetools create -t "$(GHCR):$(TAG)" $$ghcr_imgs; \
+	docker buildx imagetools create -t "$(ALIYUN):$(TAG)" $$aliyun_imgs; \
 	if [ "$(TAG)" != "latest" ]; then \
-		echo "=== Multi-arch manifest: latest ==="; \
-		docker buildx imagetools create -t "$(GHCR):latest" $$manifest_imgs; \
+		echo "=== Multi-arch manifest (GHCR): latest ==="; \
+		docker buildx imagetools create -t "$(GHCR):latest" $$ghcr_imgs; \
+		echo "=== Multi-arch manifest (Aliyun): latest ==="; \
+		docker buildx imagetools create -t "$(ALIYUN):latest" $$aliyun_imgs; \
 	fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -230,12 +237,9 @@ push: stage ensure-buildkit
 
 release: build verify push
 
-ensure-buildkit:
-	@if ! docker image inspect $(BUILDKIT_TAG) >/dev/null 2>&1; then \
-		echo ">> Pulling buildkit from Aliyun and tagging locally..."; \
-		docker pull $(BUILDKIT_SRC); \
-		docker tag $(BUILDKIT_SRC) $(BUILDKIT_TAG); \
-	fi
+ensure-builder:
+	@docker buildx inspect yat-builder >/dev/null 2>&1 || \
+		docker buildx create --name yat-builder --driver docker-container --use
 
 clean:
 	cargo clean

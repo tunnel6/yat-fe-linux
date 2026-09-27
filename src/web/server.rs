@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
   extract::State,
-  response::Html,
+  response::{Html, IntoResponse},
   routing::{get, post},
   Json, Router,
 };
@@ -66,8 +66,11 @@ async fn index_handler() -> Html<&'static str> {
   Html(include_str!("../../web/dashboard.html"))
 }
 
-async fn static_handler() -> Html<&'static str>{
-  Html(include_str!("../../web/tailwindcss-3.4.17.js"))
+async fn static_handler() -> impl IntoResponse {
+  (
+    [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+    include_str!("../../web/tailwindcss-3.4.17.js"),
+  )
 }
 
 // ─── API handlers ────────────────────────────────────────────────────────────

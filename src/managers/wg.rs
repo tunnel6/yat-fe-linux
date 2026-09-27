@@ -27,6 +27,7 @@ use yat_wireguard::types::{
   ApplyRuntimeParams, ClearNetworkStateParams, LocalConfigPeerInput,
   LocalIdentityParams, SyncLocalConfigParams,
 };
+use std::collections::HashMap;
 
 // ─── EdgeJoinContext ─────────────────────────────────────────────────────────
 
@@ -40,6 +41,7 @@ pub struct EdgeJoinContext {
   pub network_id: String,
   pub storage_dir: String,
   pub member_id: String,
+  pub client_id: String,
   pub self_address: String,
   pub hostname: String,
   pub peer_count: u32,
@@ -152,7 +154,8 @@ impl WgManager {
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))?
     .map_err(|e| anyhow::anyhow!("Failed to get/create WG identity: {e}"))?;
-    info!("WG public key: {}", identity.public_key);
+    let client_id = identity.client_id.clone();
+    info!("WG public key: {}, client_id: {}", identity.public_key, client_id);
 
     // ── Get network snapshot ─────────────────────────────────────────────
     info!("Fetching network snapshot...");
@@ -213,6 +216,7 @@ impl WgManager {
       network_id: network_id.to_string(),
       storage_dir: storage_dir_str,
       member_id,
+      client_id,
       self_address,
       hostname: self_hostname,
       peer_count,
@@ -229,7 +233,7 @@ impl WgManager {
   /// persists connection state and prints a summary.
   pub async fn apply_wg(&mut self, ctx: EdgeJoinContext) -> Result<WgStatus> {
     let EdgeJoinContext {
-      edge, network_id, storage_dir, member_id, self_address,
+      edge, network_id, storage_dir, member_id, client_id: _, self_address,
       hostname: _, peer_count: _, interface_name, snapshot,
     } = ctx;
 
@@ -646,14 +650,58 @@ pub(crate) fn is_valid_wireguard_key(key: &str) -> bool {
   }
 }
 
+/// Extract the public IP address from an endpoint string.
+///
+/// Handles formats:
+/// - `1.2.3.4:58021` → `1.2.3.4`
+/// - `[::1]:58021`   → `::1`
+/// - `host:port`     → `host`
+pub(crate) fn extract_public_ip(endpoint: &str) -> String {
+  let trimmed = endpoint.trim();
+  if trimmed.is_empty() {
+    return String::new();
+  }
+  // IPv6 bracket notation: [::1]:port
+  if trimmed.starts_with('[') {
+    if let Some(bracket_end) = trimmed.find(']') {
+      return trimmed[1..bracket_end].to_string();
+    }
+  }
+  // IPv4 or hostname: host:port — split on last ':' to handle IPv4 only
+  if let Some(colon_pos) = trimmed.rfind(':') {
+    return trimmed[..colon_pos].to_string();
+  }
+  trimmed.to_string()
+}
+
 /// Build peer list from a network snapshot (excludes self).
 ///
 /// Members whose `public_key` is empty or not a valid WireGuard key
 /// (e.g. placeholder values like a client-ID or port number) are silently
 /// skipped — they cannot be programmed into the interface.
+///
+/// Same-NAT optimization: when self and a remote peer share the same
+/// observed public IP (same-NAT), prefer the LAN endpoint from
+/// `lan_peer_endpoints` over the public observed endpoint. Without this,
+/// hairpin NAT is required which often fails on consumer routers.
 fn build_peers_from_snapshot(
   snapshot: &WGNetworkRuntimeSnapshotData,
 ) -> Vec<LocalConfigPeerInput> {
+  // Find self's observed public IP for same-NAT detection.
+  let self_observed_ip = snapshot
+    .members
+    .iter()
+    .find(|m| m.is_current_device)
+    .map(|m| extract_public_ip(&m.observed_endpoint))
+    .unwrap_or_default();
+
+  // Build lookup: public_key → LAN endpoint from edge's same-NAT detection.
+  let lan_map: HashMap<&str, &str> = snapshot
+    .lan_peer_endpoints
+    .iter()
+    .map(|ep| (ep.public_key.as_str(), ep.lan_endpoint.as_str()))
+    .collect();
+
   let mut peers = Vec::with_capacity(snapshot.members.len());
   for m in &snapshot.members {
     if m.is_current_device {
@@ -666,11 +714,37 @@ fn build_peers_from_snapshot(
       );
       continue;
     }
-    let endpoint = if m.observed_endpoint.is_empty() {
-      None
+
+    // Determine the best endpoint for this peer.
+    // Same-NAT: prefer LAN endpoint; fall back to observed (hairpin NAT).
+    // Diff-NAT: use observed public endpoint directly.
+    let public_direct_ip = extract_public_ip(&m.observed_endpoint);
+    let is_same_nat = !self_observed_ip.is_empty()
+      && !public_direct_ip.is_empty()
+      && self_observed_ip == public_direct_ip;
+
+    let lan_endpoint = if is_same_nat {
+      lan_map.get(m.public_key.as_str()).copied().unwrap_or("")
     } else {
-      Some(m.observed_endpoint.clone())
+      ""
     };
+
+    let endpoint = if !lan_endpoint.is_empty() {
+      Some(lan_endpoint.to_string())
+    } else if !m.observed_endpoint.is_empty() {
+      Some(m.observed_endpoint.clone())
+    } else {
+      None
+    };
+
+    if is_same_nat && lan_endpoint.is_empty() {
+      info!(
+        "Same-NAT detected for peer {} (device {}) but no LAN endpoint available yet, \
+         falling back to observed endpoint (hairpin NAT)",
+        m.member_id, m.device_id
+      );
+    }
+
     // Each peer's allowed_ips is its own assigned IP /32, not the whole subnet.
     let allowed_ip = if m.assigned_ip.contains('/') {
       m.assigned_ip.clone()
