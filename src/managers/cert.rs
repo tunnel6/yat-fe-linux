@@ -80,18 +80,16 @@ impl CertManager {
       && self.certs_dir().join("client.key").exists()
   }
 
-  /// Bootstrap a client certificate from the Edge using OAuth credentials.
+  /// Bootstrap a client certificate from the Edge using an invite token.
   ///
   /// Creates a one-way TLS connection (no client cert), sends a `CertRequest`
-  /// with the given OAuth token, and stores the returned certificate + key.
-  /// This is the primary certificate acquisition path for new-format shares.
+  /// with the invite token, and stores the returned certificate + key.
+  /// Edge signs via EdgeCA locally — no OAuth needed.
   pub async fn bootstrap_certificate(
     &self,
     edge_config: &crate::config::EdgeConfig,
-    oauth_token: &str,
-    oauth_provider: &str,
-    user_id: &str,
     device_id: &str,
+    invite_token: &str,
   ) -> Result<()> {
     use yat_transport::{EdgeClient, EdgeClientConfig};
 
@@ -114,14 +112,26 @@ impl CertManager {
     let client = EdgeClient::new(config);
 
     tracing::info!(
-      "Requesting certificate from Edge for device {}...",
-      device_id
+      "Requesting certificate from Edge ({}:{}) via invite token for device {}...",
+      edge_config.host, edge_config.port, device_id
     );
 
-    let result = client
-      .request_certificate(oauth_token, oauth_provider, user_id, device_id)
+    let result = match client
+      .request_certificate("", "", "", device_id, invite_token, &[])
       .await
-      .context("Certificate request failed")?;
+    {
+      Ok(r) => r,
+      Err(e) => {
+        // Strip redundant "Certificate error: " / "Connection error: " prefix
+        let msg = e.to_string();
+        let msg = msg
+          .strip_prefix("Certificate error: ")
+          .or_else(|| msg.strip_prefix("Connection error: "))
+          .or_else(|| msg.strip_prefix("TLS error: "))
+          .unwrap_or(&msg);
+        anyhow::bail!("{msg}");
+      }
+    };
 
     // Store the certificate and key
     let certs_dir = self.certs_dir();

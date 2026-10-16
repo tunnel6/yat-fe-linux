@@ -7,20 +7,34 @@ use tracing::info;
 /// Reads share.json, validates required fields, and writes config to
 /// `~/.config/yat-cli/`.
 ///
-/// ## Certificate bootstrap
+/// ## Share package format (v1)
 ///
-/// **New format** (with `auth` section): the share contains an OAuth token
-/// and provider.  The CLI persists these in config.json; on first `serve`
-/// it uses them to request its own mTLS certificate from the Edge via
-/// `CertRequest`, ensuring the certificate is bound to the local deviceId.
+/// Two export modes are supported:
 ///
-/// **Legacy format** (with `certificates.clientCert`): the share contains
-/// pre-built mTLS certificates.  These are imported as-is for backward
-/// compatibility.
+/// **Full cert mode** — the share contains pre-built mTLS certificates:
+/// ```json
+/// {
+///   "version": 1,
+///   "edge": { "host", "port", "serverName", "edgeId" },
+///   "network": { "networkId" },
+///   "certificates": { "caCert", "clientCert", "clientKey" }
+/// }
+/// ```
+///
+/// **Token mode** — the share contains an invite token; the client cert
+/// will be bootstrapped on first `serve`:
+/// ```json
+/// {
+///   "version": 1,
+///   "edge": { "host", "port", "serverName", "edgeId" },
+///   "network": { "networkId", "inviteToken" },
+///   "certificates": { "caCert" }
+/// }
+/// ```
 ///
 /// ## Device identity
 ///
-/// The source `deviceId` from share.json is intentionally **not** imported.
+/// The source `deviceId` from the share is intentionally **not** imported.
 /// Instead a stable local device ID is generated once and persisted in
 /// `~/.config/yat-cli/device-id`.  This ensures:
 /// - Each physical device gets a unique identity on the edge
@@ -31,13 +45,10 @@ pub fn run(file: &Path) -> Result<()> {
   let content = std::fs::read_to_string(file)?;
   let share: serde_json::Value = serde_json::from_str(&content)?;
 
-  // Validate required fields
+  // Validate required sections
   let edge = share
     .get("edge")
     .ok_or_else(|| anyhow::anyhow!("share.json missing 'edge' section"))?;
-  let identity = share
-    .get("identity")
-    .ok_or_else(|| anyhow::anyhow!("share.json missing 'identity' section"))?;
   let certificates = share
     .get("certificates")
     .ok_or_else(|| anyhow::anyhow!("share.json missing 'certificates' section"))?;
@@ -52,53 +63,57 @@ pub fn run(file: &Path) -> Result<()> {
   let local_device_id = get_or_create_local_device_id(&config_dir)?;
   info!("Local device ID: {local_device_id}");
 
-  // ── Auth credentials (new format) ───────────────────────────────────
-  let auth_section = share.get("auth");
-  let is_new_format = auth_section.is_some();
+  // ── Detect export mode ──────────────────────────────────────────────
+  let has_client_cert = certificates.get("clientCert").and_then(|v| v.as_str()).is_some();
+  let is_full_cert_mode = has_client_cert;
 
-  // Normalize camelCase (from desktop share.json) → snake_case for config.json
+  // ── Normalize edge section (camelCase → snake_case) ─────────────────
   let edge = serde_json::json!({
     "host": edge.get("host").cloned().unwrap_or_default(),
     "port": edge.get("port").cloned().unwrap_or_default(),
     "edge_id": edge.get("edgeId").or_else(|| edge.get("edge_id")).cloned(),
     "server_name": edge.get("serverName").or_else(|| edge.get("server_name")).cloned(),
   });
+
+  // ── Identity (local only — no user info from share) ─────────────────
+  let hostname = get_hostname();
   let identity = serde_json::json!({
-    // userId is kept for display/lookup, but deviceId is always the local one
-    "user_id": identity.get("userId").or_else(|| identity.get("user_id")).cloned().unwrap_or_default(),
     "device_id": local_device_id,
-    "username": identity.get("username").cloned(),
-    "hostname": identity.get("hostname").cloned(),
-  });
-  let network = serde_json::json!({
-    "network_id": network.get("networkId").or_else(|| network.get("network_id")).cloned().unwrap_or_default(),
+    "hostname": hostname,
   });
 
-  // Build config — include auth section only for new-format shares
-  let mut config = serde_json::json!({
+  // ── Network section ─────────────────────────────────────────────────
+  let network_id = network
+    .get("networkId")
+    .or_else(|| network.get("network_id"))
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .trim()
+    .to_string();
+  if network_id.is_empty() {
+    anyhow::bail!("share.json 'network' section missing networkId");
+  }
+
+  let invite_token = network
+    .get("inviteToken")
+    .or_else(|| network.get("invite_token"))
+    .and_then(|v| v.as_str())
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+
+  let mut network_json = serde_json::json!({
+    "network_id": network_id,
+  });
+  if let Some(ref token) = invite_token {
+    network_json["invite_token"] = serde_json::json!(token);
+  }
+
+  // ── Write config.json ───────────────────────────────────────────────
+  let config = serde_json::json!({
     "edge": edge,
     "identity": identity,
-    "network": network,
+    "network": network_json,
   });
-  if let Some(auth) = auth_section {
-    let oauth_token = auth
-      .get("oauthToken")
-      .or_else(|| auth.get("oauth_token"))
-      .and_then(|v| v.as_str())
-      .unwrap_or("");
-    let oauth_provider = auth
-      .get("oauthProvider")
-      .or_else(|| auth.get("oauth_provider"))
-      .and_then(|v| v.as_str())
-      .unwrap_or("");
-    if oauth_token.is_empty() || oauth_provider.is_empty() {
-      anyhow::bail!("share.json 'auth' section missing oauthToken or oauthProvider");
-    }
-    config["auth"] = serde_json::json!({
-      "oauth_token": oauth_token,
-      "oauth_provider": oauth_provider,
-    });
-  }
   std::fs::write(
     config_dir.join("config.json"),
     serde_json::to_string_pretty(&config)?,
@@ -108,30 +123,28 @@ pub fn run(file: &Path) -> Result<()> {
   let certs_dir = config_dir.join("certs");
   std::fs::create_dir_all(&certs_dir)?;
 
-  if is_new_format {
-    // New format: only CA certs (client cert will be bootstrapped on serve)
-    write_cert_if_present(&certs_dir, "ca.crt", certificates, "caCert")?;
-    write_cert_if_present(&certs_dir, "captain-ca.crt", certificates, "captainCA")?;
-    // Remove any stale client cert/key from a previous import
-    let _ = std::fs::remove_file(certs_dir.join("client.crt"));
-    let _ = std::fs::remove_file(certs_dir.join("client.key"));
-    info!("Imported CA certificates (client cert will be bootstrapped on serve).");
-  } else {
-    // Legacy format: import full cert bundle
+  // Always write CA cert
+  write_cert_if_present(&certs_dir, "ca.crt", certificates, "caCert")?;
+
+  if is_full_cert_mode {
+    // Full cert mode: import client cert + key
     write_cert_if_present(&certs_dir, "client.crt", certificates, "clientCert")?;
     write_cert_if_present(&certs_dir, "client.key", certificates, "clientKey")?;
-    write_cert_if_present(&certs_dir, "ca.crt", certificates, "caCert")?;
-    write_cert_if_present(&certs_dir, "captain-ca.crt", certificates, "captainCA")?;
-    info!("Imported legacy certificate bundle.");
+    info!("Imported full certificate bundle.");
+  } else {
+    // Token mode: only CA cert; remove any stale client cert/key from a previous import
+    let _ = std::fs::remove_file(certs_dir.join("client.crt"));
+    let _ = std::fs::remove_file(certs_dir.join("client.key"));
+    info!("Imported CA certificate (client cert will be bootstrapped via invite token on serve).");
   }
 
   info!("Import complete. Config written to {}", config_dir.display());
   println!("✓ Network package imported successfully.");
   println!("  Device ID: {local_device_id}");
-  if is_new_format {
-    println!("  Mode: OAuth token (certificate will be obtained on first connect).");
+  if is_full_cert_mode {
+    println!("  Mode: Full certificates (ready to connect).");
   } else {
-    println!("  Mode: Pre-built certificates (legacy).");
+    println!("  Mode: Invite token (certificate will be obtained on first connect).");
   }
   println!("  Run `yat-cli serve` to connect.");
   Ok(())
@@ -176,6 +189,15 @@ fn get_or_create_local_device_id(config_dir: &Path) -> Result<String> {
 fn config_dir() -> std::path::PathBuf {
   let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
   std::path::PathBuf::from(home).join(".config/yat-cli")
+}
+
+fn get_hostname() -> String {
+  std::fs::read_to_string("/etc/hostname")
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .or_else(|| std::env::var("HOSTNAME").ok())
+    .unwrap_or_else(|| "yat-cli-linux".to_string())
 }
 
 fn write_cert_if_present(

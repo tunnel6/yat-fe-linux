@@ -166,12 +166,11 @@ async fn api_config(State(state): State<AppState>) -> Json<serde_json::Value> {
           "server_name": c.edge.server_name,
         },
         "identity": {
-          "user_id": c.identity.user_id,
           "device_id": c.identity.device_id,
-          "username": c.identity.username,
           "hostname": hostname,
         },
         "network_id": c.network_id(),
+        "invite_token": c.invite_token().is_some(),
         "config_path": crate::config::config_file_path().display().to_string(),
       }))
     }

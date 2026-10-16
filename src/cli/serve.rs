@@ -4,6 +4,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{error, info, warn};
 
 use yat_wireguard::types::ClearNetworkStateParams;
+use yat_network::WgSyncController;
 
 use crate::config::AppConfig;
 use crate::daemon::loop_runner::{LogBuffer, SyncState};
@@ -164,20 +165,17 @@ async fn connect_edge(
   log_buffer.lock().await.push("INFO", "Connecting to Edge...".into());
 
   // ── Certificate bootstrap ─────────────────────────────────────────
-  // If no client certificate exists and OAuth credentials are available,
+  // If no client certificate exists and an invite token is available,
   // request one from the Edge before proceeding.
   if !cert_manager.has_client_cert() {
-    if let Some(auth) = &cfg.auth {
-      log_buffer.lock().await.push("INFO", "No client cert — bootstrapping via OAuth...".into());
+    if let Some(invite_token) = &cfg.invite_token() {
+      log_buffer.lock().await.push("INFO", "No client cert — bootstrapping via invite token...".into());
       let device_id = &cfg.identity.device_id;
-      let user_id = &cfg.identity.user_id;
       match cert_manager
         .bootstrap_certificate(
           &cfg.edge,
-          &auth.oauth_token,
-          &auth.oauth_provider,
-          user_id,
           device_id,
+          invite_token,
         )
         .await
       {
@@ -186,13 +184,27 @@ async fn connect_edge(
           log_buffer.lock().await.push("INFO", "Certificate obtained from Edge.".into());
         }
         Err(e) => {
-          error!("Certificate bootstrap failed: {e}");
-          log_buffer.lock().await.push("ERROR", format!("Cert bootstrap failed: {e}"));
+          // Extract root cause (last item in error chain)
+          let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+          let root_cause = chain.last().cloned().unwrap_or_else(|| e.to_string());
+
+          // Terminal: ANSI red + bold
+          let red = "\x1b[1;31m";
+          let reset = "\x1b[0m";
+          eprintln!();
+          eprintln!("{red}  ✗ Certificate bootstrap failed{reset}");
+          eprintln!("{red}    Edge:   {}:{}{reset}", cfg.edge.host, cfg.edge.port);
+          eprintln!("{red}    Device: {}{reset}", cfg.identity.device_id);
+          eprintln!("{red}    Reason: {root_cause}{reset}");
+          eprintln!();
+
+          error!("Certificate bootstrap failed: {root_cause}");
+          log_buffer.lock().await.push("ERROR", format!("Cert bootstrap failed: {root_cause}"));
           return;
         }
       }
     } else {
-      log_buffer.lock().await.push("ERROR", "No client cert and no OAuth token. Re-import share.json.".into());
+      log_buffer.lock().await.push("ERROR", "No client cert and no invite token. Re-import share.json.".into());
       return;
     }
   }
@@ -242,6 +254,8 @@ async fn connect_edge(
   let edge_client = Arc::clone(&ctx.edge);
   let client_id = ctx.client_id.clone();
   let self_address = ctx.self_address.clone();
+  let initial_snapshot = ctx.snapshot.clone();
+  let storage_dir_for_sync = ctx.storage_dir.clone();
 
   // Publish edge_client so the web API can use it (e.g. address update)
   {
@@ -255,10 +269,44 @@ async fn connect_edge(
     log_buffer.lock().await.push("WARN", format!("WG interface failed: {e}"));
   }
 
+  // ── Set up WgSyncController (yat-network) for ongoing WG sync ──────
+  let sync_controller = {
+    let id_params = yat_wireguard::types::LocalIdentityParams {
+      storage_dir: storage_dir_for_sync.clone(),
+      preferred_device_id: None,
+      hostname: None,
+    };
+    match tokio::task::spawn_blocking(move || {
+      yat_wireguard::identity::get_or_create_local_identity(id_params)
+    }).await {
+      Ok(Ok(identity)) => {
+        let engine = yat_network::wg::engine::create_engine(None);
+        let controller = WgSyncController::new(
+          engine, storage_dir_for_sync.clone(), true,
+        );
+        controller.set_private_key(identity.private_key);
+        let controller = Arc::new(controller);
+        controller.mark_joined(&network_id).await;
+        // Feed the initial snapshot to trigger the first sync pipeline.
+        if let Err(e) = controller.handle_typed_snapshot(&network_id, &initial_snapshot).await {
+          warn!("Initial WgSyncController sync failed: {e:#}");
+        }
+        Some(controller)
+      }
+      Ok(Err(e)) => {
+        warn!("Failed to load WG identity for sync controller: {e}");
+        None
+      }
+      Err(e) => {
+        warn!("spawn_blocking join error: {e}");
+        None
+      }
+    }
+  };
+
   // Subscribe to P2P events (gather/punch) for same-NAT LAN discovery.
   // Must be AFTER apply_wg so the WG interface (and its listen port) exists
-  // when a gather event arrives.  Edge may send gather immediately after
-  // the network join response, so we subscribe as soon as the interface is up.
+  // when a gather event arrives.
   crate::gather::subscribe_p2p_events(
     Arc::clone(&edge_client), client_id.clone(),
     storage_dir.clone(), network_id.clone(),
@@ -266,9 +314,9 @@ async fn connect_edge(
   ).await;
 
   // ── Sync loop (blocks until Edge disconnects) ───────────────────────
-  crate::daemon::loop_runner::run_sync_loop(
+  run_wg_sync_loop(
     edge_client, Arc::clone(&sync_state), Arc::clone(&log_buffer),
-    network_id.clone(), storage_dir.clone(),
+    network_id.clone(), storage_dir.clone(), sync_controller,
   ).await;
 
   // ── Reconnect loop with exponential back-off + deferred retry ───────
@@ -353,6 +401,7 @@ async fn connect_edge(
     let edge_client = Arc::clone(&ctx.edge);
     let client_id = ctx.client_id.clone();
     let self_address = ctx.self_address.clone();
+    let initial_snapshot = ctx.snapshot.clone();
 
     // Update the shared edge_client slot for web API access
     {
@@ -366,7 +415,34 @@ async fn connect_edge(
       log_buffer.lock().await.push("WARN", format!("WG interface failed: {e}"));
     }
 
-    // Subscribe to P2P events AFTER WG interface creation (see initial connection comment).
+    // Set up WgSyncController for the reconnected session.
+    let sync_controller = {
+      let id_params = yat_wireguard::types::LocalIdentityParams {
+        storage_dir: storage_dir.clone(),
+        preferred_device_id: None,
+        hostname: None,
+      };
+      match tokio::task::spawn_blocking(move || {
+        yat_wireguard::identity::get_or_create_local_identity(id_params)
+      }).await {
+        Ok(Ok(identity)) => {
+          let engine = yat_network::wg::engine::create_engine(None);
+          let controller = WgSyncController::new(
+            engine, storage_dir.clone(), true,
+          );
+          controller.set_private_key(identity.private_key);
+          let controller = Arc::new(controller);
+          controller.mark_joined(&network_id).await;
+          if let Err(e) = controller.handle_typed_snapshot(&network_id, &initial_snapshot).await {
+            warn!("Reconnect: initial WgSyncController sync failed: {e:#}");
+          }
+          Some(controller)
+        }
+        _ => None,
+      }
+    };
+
+    // Subscribe to P2P events AFTER WG interface creation.
     crate::gather::subscribe_p2p_events(
       Arc::clone(&edge_client), client_id.clone(),
       storage_dir.clone(), network_id.clone(),
@@ -374,10 +450,164 @@ async fn connect_edge(
     ).await;
 
     // Re-enter sync loop (blocks until next disconnect)
-    crate::daemon::loop_runner::run_sync_loop(
+    run_wg_sync_loop(
       edge_client, Arc::clone(&sync_state), Arc::clone(&log_buffer),
-      network_id.clone(), storage_dir.clone(),
+      network_id.clone(), storage_dir.clone(), sync_controller,
     ).await;
+  }
+}
+
+/// Sync loop: periodically fetches snapshots, feeds them to `WgSyncController`
+/// for WG config sync, and updates the dashboard `SyncState`.
+///
+/// Returns when the Edge connection is lost, so the caller can trigger reconnection.
+async fn run_wg_sync_loop(
+  edge_client: Arc<yat_transport::EdgeClient>,
+  state: Arc<Mutex<SyncState>>,
+  log_buffer: Arc<Mutex<LogBuffer>>,
+  network_id: String,
+  storage_dir: String,
+  sync_controller: Option<Arc<WgSyncController>>,
+) {
+  use crate::managers::wg::{extract_public_ip, is_valid_wireguard_key};
+  use crate::daemon::loop_runner::PeerInfo;
+
+  info!("WG sync loop started for network {network_id}.");
+
+  let mut disconnect_cycles: u32 = 0;
+  const MAX_DISCONNECT_CYCLES: u32 = 2;
+
+  loop {
+    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+    // Check if Edge is still connected
+    if !edge_client.is_connected() {
+      disconnect_cycles += 1;
+      if disconnect_cycles >= MAX_DISCONNECT_CYCLES {
+        warn!("Edge connection lost (confirmed after {} checks). Returning for reconnect.", disconnect_cycles);
+        let mut s = state.lock().await;
+        s.connected = false;
+        log_buffer.lock().await.push("WARN", "Edge connection lost".into());
+        return;
+      }
+      warn!("Edge connection check failed ({}/{}), will re-check.", disconnect_cycles, MAX_DISCONNECT_CYCLES);
+      continue;
+    }
+    disconnect_cycles = 0;
+
+    // Fetch network snapshot from Edge
+    let snapshot_result = edge_client.request_wg_get_network(&network_id).await;
+    let snapshot = match snapshot_result {
+      Ok(response) if response.success => {
+        if let Some(snap) = response.snapshot {
+          Some(snap)
+        } else {
+          continue;
+        }
+      }
+      Ok(response) => {
+        warn!("Sync: get_network failed: {} (code: {})", response.error_message, response.error_code);
+        log_buffer.lock().await.push("WARN", format!("Sync failed: {}", response.error_message));
+        None
+      }
+      Err(e) => {
+        warn!("Sync: get_network error: {e}");
+        log_buffer.lock().await.push("ERROR", format!("Sync error: {e}"));
+        None
+      }
+    };
+
+    // Feed snapshot to WgSyncController for WG config sync
+    if let (Some(ref controller), Some(ref snap)) = (&sync_controller, &snapshot) {
+      match controller.handle_typed_snapshot(&network_id, snap).await {
+        Ok(Some(result)) => {
+          if result.applied {
+            info!("WgSyncController applied config changes ({} peers)", result.local_config.peer_count);
+            log_buffer.lock().await.push("INFO", format!(
+              "WG config synced: {} peers", result.local_config.peer_count
+            ));
+          }
+        }
+        Ok(None) => {} // no changes
+        Err(e) => {
+          warn!("WgSyncController sync error: {e:#}");
+        }
+      }
+    }
+
+    // Update dashboard SyncState from snapshot
+    if let Some(snap) = snapshot {
+      let self_observed_ip = snap.members.iter()
+        .find(|m| m.is_current_device)
+        .map(|m| extract_public_ip(&m.observed_endpoint))
+        .unwrap_or_default();
+      let lan_map: std::collections::HashMap<&str, &str> = snap.lan_peer_endpoints.iter()
+        .map(|ep| (ep.public_key.as_str(), ep.lan_endpoint.as_str()))
+        .collect();
+
+      let peers: Vec<PeerInfo> = snap.members.iter()
+        .filter(|m| !m.is_current_device && is_valid_wireguard_key(&m.public_key))
+        .map(|m| {
+          let peer_ip = extract_public_ip(&m.observed_endpoint);
+          let is_same_nat = !self_observed_ip.is_empty()
+            && !peer_ip.is_empty()
+            && self_observed_ip == peer_ip;
+          let lan_ep = if is_same_nat {
+            lan_map.get(m.public_key.as_str()).copied().unwrap_or("")
+          } else {
+            ""
+          };
+          let display_endpoint = if !lan_ep.is_empty() {
+            lan_ep.to_string()
+          } else {
+            m.observed_endpoint.clone()
+          };
+          PeerInfo {
+            hostname: m.hostname.clone(),
+            assigned_ip: m.assigned_ip.clone(),
+            endpoint: display_endpoint,
+            public_key: m.public_key.clone(),
+            presence_status: m.presence_status,
+            last_handshake_at: None,
+          }
+        })
+        .collect();
+      let peer_count = peers.len() as u32;
+
+      let mut s = state.lock().await;
+      s.network_name = snap.network.name.clone();
+      s.subnet = snap.network.subnet.clone();
+      s.peer_count = peer_count;
+      s.peers = peers;
+      s.last_sync_at = Some(chrono::Local::now().to_rfc3339());
+      if let Some(self_member) = snap.members.iter().find(|m| m.is_current_device) {
+        if !self_member.hostname.is_empty() {
+          s.hostname = self_member.hostname.clone();
+        }
+      }
+    }
+
+    // Refresh live handshake stats
+    let sdir = storage_dir.clone();
+    let nid = network_id.clone();
+    let stats_result = tokio::task::spawn_blocking(move || {
+      yat_wireguard::stats::get_runtime_stats(yat_wireguard::types::RuntimeStatsParams {
+        storage_dir: sdir,
+        network_id: nid,
+      })
+    }).await;
+
+    if let Ok(Ok(Some(stats))) = stats_result {
+      let hs_map: std::collections::HashMap<String, Option<f64>> = stats.peers.into_iter()
+        .map(|p| (p.public_key, p.last_handshake_at))
+        .collect();
+      let mut s = state.lock().await;
+      for peer in s.peers.iter_mut() {
+        if let Some(Some(hs)) = hs_map.get(&peer.public_key) {
+          peer.last_handshake_at = Some(*hs);
+        }
+      }
+    }
   }
 }
 
@@ -422,15 +652,15 @@ async fn interruptible_sleep(secs: u64, notify: &Arc<Notify>) {
   }
 }
 
-/// Background task: monitor certificate expiry and auto-renew with OAuth token.
+/// Background task: monitor certificate expiry and warn the user.
 ///
-/// Checks every hour. If the certificate is within 3 days of expiry and
-/// OAuth credentials are available, automatically requests a new certificate
-/// from the Edge.  Falls back to a warning if no OAuth token is configured.
+/// Checks every hour. If the certificate is within 3 days of expiry,
+/// logs a warning. Auto-renewal requires re-import from the desktop app
+/// (invite tokens are single-use; OAuth is not used in the Linux CLI).
 async fn cert_rotation_monitor(
   cert_manager: Arc<CertManager>,
   log_buffer: Arc<Mutex<LogBuffer>>,
-  config: Option<Arc<AppConfig>>,
+  _config: Option<Arc<AppConfig>>,
 ) {
   loop {
     tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
@@ -439,52 +669,20 @@ async fn cert_rotation_monitor(
       continue;
     }
 
-    // Try auto-renewal with OAuth token
-    let Some(cfg) = &config else {
-      log_buffer.lock().await.push("WARN", "Certificate expiring but no config available.".into());
-      continue;
-    };
-    let Some(auth) = &cfg.auth else {
-      // Legacy format — no OAuth token, just warn
-      match cert_manager.cert_info() {
-        Ok(info) => {
-          let days = info.days_remaining.unwrap_or(0);
-          warn!("Certificate expires in {} days! Re-import from desktop app to renew.", days);
-          log_buffer.lock().await.push(
-            "WARN",
-            format!("Certificate expires in {} days. Re-import from desktop app to renew.", days),
-          );
-        }
-        Err(_) => {
-          log_buffer.lock().await.push(
-            "WARN",
-            "No valid certificate found. Import from desktop app.".into(),
-          );
-        }
+    match cert_manager.cert_info() {
+      Ok(info) => {
+        let days = info.days_remaining.unwrap_or(0);
+        warn!("Certificate expires in {} days! Re-import from desktop app to renew.", days);
+        log_buffer.lock().await.push(
+          "WARN",
+          format!("Certificate expires in {} days. Re-import from desktop app to renew.", days),
+        );
       }
-      continue;
-    };
-
-    // Auto-renew: request a fresh certificate
-    info!("Certificate nearing expiry — attempting auto-renewal...");
-    log_buffer.lock().await.push("INFO", "Auto-renewing certificate...".into());
-    match cert_manager
-      .bootstrap_certificate(
-        &cfg.edge,
-        &auth.oauth_token,
-        &auth.oauth_provider,
-        &cfg.identity.user_id,
-        &cfg.identity.device_id,
-      )
-      .await
-    {
-      Ok(()) => {
-        info!("Certificate auto-renewal successful.");
-        log_buffer.lock().await.push("INFO", "Certificate renewed successfully.".into());
-      }
-      Err(e) => {
-        warn!("Certificate auto-renewal failed: {e}");
-        log_buffer.lock().await.push("WARN", format!("Cert renewal failed: {e}"));
+      Err(_) => {
+        log_buffer.lock().await.push(
+          "WARN",
+          "No valid certificate found. Import from desktop app.".into(),
+        );
       }
     }
   }
@@ -533,46 +731,37 @@ fn start_signal_handler() {
   });
 }
 
-/// Clean up the WireGuard interface (yat0) before process exit.
+/// Clean up all WireGuard interfaces before process exit.
 ///
-/// Reads the persisted `state.json` to find the `network_id` and
-/// `storage_dir`, then calls `clear_network_state` which runs
-/// `ip link del yat0` to remove the interface.
+/// Uses yat-network's `teardown_all_networks` to scan the WG storage
+/// directory and remove all known network interfaces. This is more
+/// robust than the old approach (reading state.json for a single network_id)
+/// because it handles multiple networks and doesn't depend on state.json.
 ///
-/// This is necessary because `process::exit(0)` skips all Rust `Drop`
-/// destructors, so the interface would otherwise be left behind.
+/// Called from the signal handler thread — creates a temporary tokio runtime
+/// since `teardown_all_networks` is async.
 fn perform_shutdown_cleanup() {
-  // Read state.json to get network_id
-  let state_path = crate::config::config_dir().join("state.json");
-  let state_content = match std::fs::read_to_string(&state_path) {
-    Ok(c) => c,
-    Err(_) => return, // No state file — no WG interface to clean up
-  };
-  let state: serde_json::Value = match serde_json::from_str(&state_content) {
-    Ok(v) => v,
-    Err(_) => return,
-  };
-
-  let network_id = match state.get("network_id").and_then(|v| v.as_str()) {
-    Some(s) if !s.is_empty() => s.to_string(),
-    _ => return,
-  };
-
   let storage_dir = crate::config::config_dir()
     .join("wireguard")
     .to_string_lossy()
     .to_string();
 
-  eprintln!("Cleaning up WireGuard interface...");
-  match yat_wireguard::runtime::clear_network_state(ClearNetworkStateParams {
-    storage_dir,
-    network_id,
-  }) {
-    Ok(r) if r.removed => eprintln!("WireGuard interface removed."),
-    Ok(_) => {} // No state found — interface already gone
-    Err(e) => eprintln!("Warning: WG cleanup failed: {e}"),
-  }
+  eprintln!("Cleaning up WireGuard interfaces...");
+
+  // Create a temporary tokio runtime for the async teardown call.
+  // This runs on the signal handler thread, not the main tokio runtime.
+  let rt = match tokio::runtime::Builder::new_current_thread().build() {
+    Ok(rt) => rt,
+    Err(e) => {
+      eprintln!("Warning: failed to create runtime for teardown: {e}");
+      return;
+    }
+  };
+
+  let engine = yat_network::wg::engine::create_engine(None);
+  rt.block_on(yat_network::teardown_all_networks(&engine, &storage_dir));
 
   // Remove stale state file
+  let state_path = crate::config::config_dir().join("state.json");
   let _ = std::fs::remove_file(&state_path);
 }

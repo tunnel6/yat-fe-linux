@@ -1,6 +1,42 @@
 # YAT Linux Client 发布说明
 
-YAT Linux Client (`yat-client`) 是 YAT 平台的 Linux 原生客户端，基于 Rust 构建，提供 WireGuard 组网能力与 Web 管理界面。支持 x86_64 / arm64 双架构，可通过 Docker 或二进制文件直接运行。
+YAT Linux Client (`yat-client`) 是 YAT 平台的 Linux 原生客户端，基于 Rust 构建，提供 WireGuard 组网的能力与 Web 管理界面。支持 x86_64 / arm64 双架构，可通过 Docker 或二进制文件直接运行。
+
+---
+
+## 版本更新记录
+
+### v0.2.0 (2026-10-16)
+
+**新导出格式支持**
+- 支持桌面端新版 Share Package 导出格式，分为两种模式：
+  - **完整证书模式**：导出包含完整的客户端证书和私钥，导入后即可直接连接
+  - **令牌模式**：导出包含邀请令牌，首次连接时自动从 Edge 服务器获取证书（无需 OAuth 登录）
+- 两种模式均自动生成文件名：`yat-net-{Edge标识}-{网络ID}.json`
+
+**证书获取方式变更**
+- 不再依赖 OAuth 登录获取证书
+- 令牌模式下，客户端首次启动时自动通过邀请令牌向 Edge 申请证书
+- 证书到期后需从桌面端重新导出新的分享包进行更新
+
+**WireGuard 网络同步升级**
+- 采用全新的网络同步引擎，支持：
+  - Relay 中继路径自动管理（无法直连时自动通过中继转发）
+  - 路径选择与动态切换（直连 ↔ 中继自动切换）
+  - Peer 健康检查（基于 WireGuard 握手状态判断连接质量）
+  - 网络拓扑变化时自动更新 WireGuard 配置
+
+**其他改进**
+- 关机时自动清理所有 WireGuard 网络接口（支持多网络场景）
+- 精简配置结构，移除不再需要的用户身份信息和 OAuth 配置
+
+### v0.1.0
+
+- 初始版本
+- WireGuard 组网 + Web Dashboard
+- Edge 连接 + 自动重连
+- 证书管理与监控
+- 同 NAT LAN 端点发现
 
 ---
 
@@ -202,7 +238,7 @@ Peers:      3
 ### Settings 标签页
 
 - **Edge Connection** — 查看 Edge 服务器地址、端口、Edge ID
-- **Identity** — 查看用户 ID、设备 ID、主机名
+- **Identity** — 查看设备 ID、主机名
 - **Import** — 拖拽上传 `share.json` 文件，导入后自动重启服务
 - **Reconnect** — 手动触发重连（断线时可用）
 - **Update Address** — 动态修改设备在网络中的 IP 地址
@@ -212,7 +248,7 @@ Peers:      3
 - 暗色主题，YAT 绿色风格
 - 5 秒自动刷新状态数据
 - 支持无配置启动 — 先启动 Dashboard，再通过 Web 界面导入配置
-- 证书到期自动监控 — 每小时检查，临近过期自动续期（需 OAuth 凭据）
+- 证书到期自动监控 — 每小时检查，临近过期时显示提醒
 - 断线自动重连 — 指数退避策略，最多重试 10 次后进入 30 分钟等待
 
 ---
@@ -223,14 +259,12 @@ Peers:      3
 
 ```
 ~/.config/yat-cli/
-├── config.json          # 主配置文件（Edge 连接 + 身份信息）
-├── device-id            # 本地设备 ID（稳定，跨导入不变）
-├── device-identity.json # 设备身份（WG 密钥对关联）
+├── config.json   # 主配置文件（Edge 连接 + 设备身份 + 网络配置）
+├── device-id     # 本地设备 ID（稳定，跨导入不变）
 └── certs/
-    ├── ca.crt           # CA 证书
-    ├── captain-ca.crt   # Captain CA 证书
-    ├── client.crt       # 客户端证书
-    └── client.key       # 客户端私钥
+    ├── ca.crt      # CA 证书
+    ├── client.crt  # 客户端证书（完整证书模式 / 令牌引导后生成）
+    └── client.key  # 客户端私钥（完整证书模式 / 令牌引导后生成）
 ```
 
 ---
@@ -254,8 +288,8 @@ A: WireGuard 需要创建 TUN 网络接口并配置路由，这些操作需要�
 **Q: Docker 容器重启后配置丢失？**  
 A: 请挂载持久化卷 `-v ~/.config/yat-cli:/root/.config/yat-cli`。
 
-**Q: 证书过期了怎么办？**  
-A: 如果通过 `share.json` 导入（含 OAuth 凭据），系统会自动续期。否则需从桌面端重新导出并导入。
+**Q: 证书过期了怎么办？**
+A: 从桌面端重新导出新的分享包（完整证书模式或令牌模式），导入后自动更新证书。
 
 **Q: 如何在后台运行？**  
 A: 使用 Docker 方式（`docker run -d`），或使用 `nohup sudo yat-client serve &`。也可以创建 systemd service。

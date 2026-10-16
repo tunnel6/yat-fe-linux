@@ -4,6 +4,42 @@ YAT Linux Client (`yat-client`) is the native Linux client for the YAT platform,
 
 ---
 
+## Changelog
+
+### v0.2.0 (2026-10-16)
+
+**New Share Package Format**
+- Supports the desktop app's new Share Package export format with two modes:
+  - **Full Certificate Mode**: Exports the complete client certificate and private key — ready to connect immediately after import
+  - **Token Mode**: Exports an invite token — the client automatically obtains a certificate from the Edge server on first connection (no OAuth login required)
+- Both modes auto-generate filenames: `yat-net-{EdgeID}-{NetworkID}.json`
+
+**Certificate Provisioning Changes**
+- No longer depends on OAuth login for certificate provisioning
+- In token mode, the client automatically requests a certificate from the Edge via invite token on first startup
+- After certificate expiry, re-export a new share package from the desktop app to update
+
+**WireGuard Network Sync Upgrade**
+- Powered by a new network sync engine with:
+  - Automatic relay path management (falls back to relay when direct connection is unavailable)
+  - Dynamic path switching (direct ↔ relay)
+  - Peer health checks (based on WireGuard handshake status)
+  - Automatic WireGuard config updates on network topology changes
+
+**Other Improvements**
+- Automatic cleanup of all WireGuard interfaces on shutdown (supports multi-network scenarios)
+- Simplified config structure — removed user identity and OAuth-related configuration
+
+### v0.1.0
+
+- Initial release
+- WireGuard networking + Web Dashboard
+- Edge connection + auto-reconnect
+- Certificate management & monitoring
+- Same-NAT LAN endpoint discovery
+
+---
+
 ## Quick Start
 
 Get a Linux machine connected to your YAT WireGuard network in three steps:
@@ -202,7 +238,7 @@ After starting the `serve` command, a feature-rich Web Dashboard is available in
 ### Settings Tab
 
 - **Edge Connection** — View Edge server host, port, and Edge ID
-- **Identity** — View User ID, Device ID, and hostname
+- **Identity** — View Device ID and hostname
 - **Import** — Drag-and-drop `share.json` upload; service restarts automatically after import
 - **Reconnect** — Manually trigger Edge reconnection (useful when disconnected)
 - **Update Address** — Dynamically change this device's IP address within the network
@@ -212,7 +248,7 @@ After starting the `serve` command, a feature-rich Web Dashboard is available in
 - Dark theme with YAT green accent (#22c55e)
 - Auto-refresh status data every 5 seconds
 - Zero-config startup — launch the Dashboard first, then import config via the Web UI
-- Automatic certificate monitoring — checks hourly, auto-renews when nearing expiry (requires OAuth credentials)
+- Automatic certificate monitoring — checks hourly, shows a reminder when nearing expiry
 - Auto-reconnect on disconnect — exponential backoff strategy, up to 10 retries before entering a 30-minute cooldown
 
 ---
@@ -223,14 +259,12 @@ Configuration files are stored in `~/.config/yat-cli/`:
 
 ```
 ~/.config/yat-cli/
-├── config.json          # Main config (Edge connection + identity)
-├── device-id            # Local device ID (stable across re-imports)
-├── device-identity.json # Device identity (associated with WG key pair)
+├── config.json   # Main config (Edge connection + device identity + network config)
+├── device-id     # Local device ID (stable across re-imports)
 └── certs/
-    ├── ca.crt           # CA certificate
-    ├── captain-ca.crt   # Captain CA certificate
-    ├── client.crt       # Client certificate
-    └── client.key       # Client private key
+    ├── ca.crt      # CA certificate
+    ├── client.crt  # Client certificate (full cert mode / generated after token bootstrap)
+    └── client.key  # Client private key (full cert mode / generated after token bootstrap)
 ```
 
 ---
@@ -254,8 +288,8 @@ A: WireGuard requires creating a TUN network interface and configuring routes, w
 **Q: Configuration lost after container restart?**  
 A: Mount a persistent volume with `-v ~/.config/yat-cli:/root/.config/yat-cli`.
 
-**Q: What if the certificate expires?**  
-A: If imported via `share.json` (with OAuth credentials), the system auto-renews. Otherwise, re-export from the desktop app and re-import.
+**Q: What if the certificate expires?**
+A: Re-export a new share package (full certificate mode or token mode) from the desktop app and import it — the certificate will be updated automatically.
 
 **Q: How to run in the background?**  
 A: Use Docker (`docker run -d`), or `nohup sudo yat-client serve &`. You can also create a systemd service unit.

@@ -1,8 +1,17 @@
 //! Configuration data types and loading for yat-cli.
 //!
-//! Pure data layer: `AppConfig`, `DeviceIdentity`, config file I/O,
-//! and the `config_dir()` path helper. Business-level path resolution
-//! (certs, WG storage) lives in `managers::CertManager`.
+//! Pure data layer: `AppConfig`, config file I/O, and the `config_dir()`
+//! path helper. Business-level path resolution (certs, WG storage) lives
+//! in `managers::CertManager`.
+//!
+//! ## Share package format (v1)
+//!
+//! The desktop UI exports two modes:
+//! - **Full cert mode**: `edge` + `network(networkId)` + `certificates(caCert, clientCert, clientKey)`
+//! - **Token mode**: `edge` + `network(networkId, inviteToken)` + `certificates(caCert)`
+//!
+//! There is no `identity` or `auth` section — the CLI generates its own
+//! device identity locally and uses invite tokens for cert bootstrap.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,9 +23,7 @@ use std::path::PathBuf;
 pub struct AppConfig {
   pub edge: EdgeConfig,
   pub identity: IdentityConfig,
-  #[serde(default)]
-  pub auth: Option<AuthConfig>,
-  pub network: Option<serde_json::Value>,
+  pub network: Option<NetworkConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,40 +38,35 @@ pub struct EdgeConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IdentityConfig {
-  pub user_id: String,
   pub device_id: String,
-  #[serde(default)]
-  pub username: Option<String>,
   #[serde(default)]
   pub hostname: Option<String>,
 }
 
-/// OAuth credentials for certificate bootstrap.
+/// Network configuration imported from a share package.
 ///
-/// The Linux CLI uses these to request its own mTLS certificate from the
-/// Edge via `CertRequest`.  This ensures the certificate is bound to the
-/// local deviceId rather than the source device's identity.
+/// `invite_token` is present in token mode (client cert will be bootstrapped
+/// on first serve). It is `None` in full cert mode (certs already imported).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AuthConfig {
-  pub oauth_token: String,
-  pub oauth_provider: String,
+pub struct NetworkConfig {
+  pub network_id: String,
+  #[serde(default)]
+  pub invite_token: Option<String>,
 }
 
 impl AppConfig {
-  /// Extract network ID from the stored network value.
-  /// Tries both `networkId` (camelCase from Electron) and `network_id`.
+  /// Get the network ID, if a network has been imported.
   pub fn network_id(&self) -> Option<String> {
-    self.network.as_ref().and_then(|n| {
-      n.get("networkId")
-        .or_else(|| n.get("network_id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    })
+    self.network.as_ref().map(|n| n.network_id.clone()).filter(|s| !s.is_empty())
+  }
+
+  /// Get the invite token, if present (token mode import).
+  pub fn invite_token(&self) -> Option<String> {
+    self.network.as_ref().and_then(|n| n.invite_token.clone())
   }
 }
 
-// ─── Device identity (persistent across runs, used for WG key material) ──────
+// ─── Device identity (convenience view over config identity fields) ──────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceIdentity {
@@ -84,28 +86,21 @@ pub fn load_config() -> Result<AppConfig> {
 }
 
 pub fn load_device_identity() -> Result<DeviceIdentity> {
-  let path = device_identity_path();
-  if path.exists() {
-    let content = std::fs::read_to_string(&path)?;
-    let identity: DeviceIdentity = serde_json::from_str(&content)?;
-    Ok(identity)
-  } else {
-    // Fall back to config identity
-    let config = load_config()?;
-    Ok(DeviceIdentity {
-      device_id: config.identity.device_id.clone(),
-      hostname: config.identity.hostname.clone(),
-    })
-  }
+  let config = load_config()?;
+  Ok(DeviceIdentity {
+    device_id: config.identity.device_id,
+    hostname: config.identity.hostname,
+  })
 }
 
 #[allow(dead_code)]
 pub fn save_device_identity(identity: &DeviceIdentity) -> Result<()> {
-  let path = device_identity_path();
-  if let Some(parent) = path.parent() {
-    std::fs::create_dir_all(parent)?;
-  }
-  std::fs::write(&path, serde_json::to_string_pretty(identity)?)?;
+  // Update the identity fields in config.json
+  let mut config = load_config()?;
+  config.identity.device_id = identity.device_id.clone();
+  config.identity.hostname = identity.hostname.clone();
+  let path = config_file_path();
+  std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
   Ok(())
 }
 
@@ -118,10 +113,6 @@ pub fn config_dir() -> PathBuf {
 
 pub fn config_file_path() -> PathBuf {
   config_dir().join("config.json")
-}
-
-pub fn device_identity_path() -> PathBuf {
-  config_dir().join("device-identity.json")
 }
 
 /// Get hostname for the current machine.

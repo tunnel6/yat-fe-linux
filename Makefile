@@ -187,31 +187,21 @@ docker: stage ensure-builder
 # ══════════════════════════════════════════════════════════════════════════════
 
 push: stage ensure-builder
-	@# ── Step 1: buildx build & push to GHCR only ──
+	@# ── Step 1: buildx build & push to both registries ──
 	@$(foreach t,$(DX_ACTIVE), \
 		arch=$(lastword $(subst -,$(sp),$(t))); \
 		if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
 		if [ "$$arch" = "armv7" ]; then plat=linux/arm/v7; else plat=linux/$$arch; fi; \
 		base="$(BASE_$(t))"; \
 		if [ "$(TAG)" = "latest" ]; then arch_tag=$$dx; else arch_tag=$$dx-$(TAG); fi; \
-		echo ">> buildx push $$plat → GHCR BASE=$$base"; \
+		echo ">> buildx push $$plat → GHCR+Aliyun BASE=$$base"; \
 		eval docker buildx build --pull --provenance=false --platform "$$plat" --push \
 			--build-arg VARIANT=gnu --build-arg BASE_IMAGE=$$base \
 			-t $(GHCR):$$arch_tag \
+			-t $(ALIYUN):$$arch_tag \
 			-f Dockerfile .; \
 	)
-	@# ── Step 2: skopeo copy GHCR → Aliyun (per-arch) ──
-	@echo "=== skopeo sync GHCR → Aliyun ==="; \
-	$(foreach t,$(DX_ACTIVE), \
-		arch=$(lastword $(subst -,$(sp),$(t))); \
-		if [ "$$arch" = "armv7" ]; then dx=arm; else dx=$$arch; fi; \
-		if [ "$(TAG)" = "latest" ]; then arch_tag=$$dx; else arch_tag=$$dx-$(TAG); fi; \
-		echo "  $(GHCR):$$arch_tag → $(ALIYUN):$$arch_tag"; \
-		skopeo copy --all \
-			docker://$(GHCR):$$arch_tag \
-			docker://$(ALIYUN):$$arch_tag; \
-	)
-	@# ── Step 3: multi-arch manifest (both registries) ──
+	@# ── Step 2: multi-arch manifest (both registries) ──
 	@echo "=== Multi-arch manifest (GHCR): $(TAG) ==="; \
 	ghcr_imgs=""; \
 	aliyun_imgs=""; \

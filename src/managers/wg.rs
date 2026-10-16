@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 use yat_transport::{
   EdgeClient, EdgeClientConfig,
-  WGGetNetworkResponseData, WGNetworkRuntimeSnapshotData,
+  WGNetworkRuntimeSnapshotData,
 };
 use yat_wireguard::types::{
   ApplyRuntimeParams, ClearNetworkStateParams, LocalConfigPeerInput,
@@ -46,7 +46,7 @@ pub struct EdgeJoinContext {
   pub hostname: String,
   pub peer_count: u32,
   pub interface_name: String,
-  snapshot: WGNetworkRuntimeSnapshotData,
+  pub snapshot: WGNetworkRuntimeSnapshotData,
 }
 
 use crate::config::{self, DeviceIdentity};
@@ -114,8 +114,8 @@ impl WgManager {
   /// 1. Load certs + device identity
   /// 2. EdgeClient → connect (mTLS) → authenticate
   /// 3. Get/create WG identity
-  /// 4. Join WG network (if needed)
-  /// 5. Re-fetch snapshot (post-join)
+  /// 4. Join WG network (creates member record on Edge)
+  /// 5. Fetch snapshot (post-join, passes isNetworkOwnerOrMember check)
   ///
   /// Returns an [`EdgeJoinContext`] that carries everything the caller needs
   /// to later apply the WireGuard interface (phase 2) **or** to keep the
@@ -132,9 +132,9 @@ impl WgManager {
       .ok_or_else(|| anyhow::anyhow!("No network configured. Run `yat-cli import <share.json>` first."))?;
 
     info!(
-      "Edge: {}:{} | User: {} | Device: {} | Network: {}",
+      "Edge: {}:{} | Device: {} | Network: {}",
       self.config.edge.host, self.config.edge.port,
-      self.config.identity.user_id, device_identity.device_id,
+      device_identity.device_id,
       network_id,
     );
 
@@ -157,25 +157,16 @@ impl WgManager {
     let client_id = identity.client_id.clone();
     info!("WG public key: {}, client_id: {}", identity.public_key, client_id);
 
-    // ── Get network snapshot ─────────────────────────────────────────────
-    info!("Fetching network snapshot...");
-    let net_response = edge
-      .request_wg_get_network(&network_id)
-      .await
-      .context("Failed to get network info")?;
-    if !net_response.success {
-      anyhow::bail!(
-        "Failed to get network: {} (code: {})",
-        net_response.error_message, net_response.error_code
-      );
-    }
-
-    // ── Join if needed ───────────────────────────────────────────────────
+    // ── Join network FIRST ─────────────────────────────────────────────
+    // Must join before fetching the snapshot: the Edge WG_GET_NETWORK handler
+    // enforces isNetworkOwnerOrMember — a new device that hasn't joined yet
+    // will get "network not found" even with a valid scoped certificate.
+    let invite_token = self.config.invite_token().unwrap_or_default();
     let (member_id, assigned_ip) = self.resolve_membership(
-      &edge, &network_id, &identity, &hostname, &net_response,
+      &edge, &network_id, &identity, &hostname, &invite_token,
     ).await?;
 
-    // ── Re-fetch snapshot (post-join) ────────────────────────────────────
+    // ── Fetch snapshot (post-join) ─────────────────────────────────────
     let snapshot = {
       let refresh = edge
         .request_wg_get_network(&network_id)
@@ -454,7 +445,7 @@ impl WgManager {
     info!("Authenticating...");
     let auth_result = client
       .authenticate(
-        &self.config.identity.user_id,
+        "", // no user_id — invite-token cert has network scope
         &device_identity.device_id,
         hostname,
         env!("CARGO_PKG_VERSION"),
@@ -494,11 +485,11 @@ impl WgManager {
     network_id: &str,
     identity: &yat_wireguard::types::LocalIdentity,
     hostname: &str,
-    _net_response: &WGGetNetworkResponseData,
+    invite_token: &str,
   ) -> Result<(String, String)> {
     info!("Joining network (sending real public key for upgrade)...");
     let join_result = edge
-      .join_wg_network(network_id, &identity.client_id, &identity.public_key, hostname)
+      .join_wg_network(network_id, &identity.client_id, &identity.public_key, hostname, invite_token)
       .await
       .context("Failed to join network")?;
     if !join_result.success {
