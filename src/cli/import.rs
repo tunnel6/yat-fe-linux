@@ -1,214 +1,155 @@
-use anyhow::Result;
-use std::path::Path;
-use tracing::info;
+use anyhow::{Context, Result};
+use std::{
+  io::{Read, Write},
+  os::unix::fs::{OpenOptionsExt, PermissionsExt},
+  path::Path,
+};
 
-/// Import a shared network package from the desktop UI.
-///
-/// Reads share.json, validates required fields, and writes config to
-/// `~/.config/yat-cli/`.
-///
-/// ## Share package format (v1)
-///
-/// Two export modes are supported:
-///
-/// **Full cert mode** — the share contains pre-built mTLS certificates:
-/// ```json
-/// {
-///   "version": 1,
-///   "edge": { "host", "port", "serverName", "edgeId" },
-///   "network": { "networkId" },
-///   "certificates": { "caCert", "clientCert", "clientKey" }
-/// }
-/// ```
-///
-/// **Token mode** — the share contains an invite token; the client cert
-/// will be bootstrapped on first `serve`:
-/// ```json
-/// {
-///   "version": 1,
-///   "edge": { "host", "port", "serverName", "edgeId" },
-///   "network": { "networkId", "inviteToken" },
-///   "certificates": { "caCert" }
-/// }
-/// ```
-///
-/// ## Device identity
-///
-/// The source `deviceId` from the share is intentionally **not** imported.
-/// Instead a stable local device ID is generated once and persisted in
-/// `~/.config/yat-cli/device-id`.  This ensures:
-/// - Each physical device gets a unique identity on the edge
-/// - Re-importing the same share.json does not create duplicate peers
-pub fn run(file: &Path) -> Result<()> {
-  info!("Importing share package from: {}", file.display());
+const MAX_IMPORT: usize = 256 * 1024;
 
-  let content = std::fs::read_to_string(file)?;
-  let share: serde_json::Value = serde_json::from_str(&content)?;
-
-  // Validate required sections
-  let edge = share
-    .get("edge")
-    .ok_or_else(|| anyhow::anyhow!("share.json missing 'edge' section"))?;
-  let certificates = share
-    .get("certificates")
-    .ok_or_else(|| anyhow::anyhow!("share.json missing 'certificates' section"))?;
-  let network = share
-    .get("network")
-    .ok_or_else(|| anyhow::anyhow!("share.json missing 'network' section"))?;
-
-  let config_dir = config_dir();
-  std::fs::create_dir_all(&config_dir)?;
-
-  // ── Local device ID (stable across re-imports) ──────────────────────
-  let local_device_id = get_or_create_local_device_id(&config_dir)?;
-  info!("Local device ID: {local_device_id}");
-
-  // ── Detect export mode ──────────────────────────────────────────────
-  let has_client_cert = certificates.get("clientCert").and_then(|v| v.as_str()).is_some();
-  let is_full_cert_mode = has_client_cert;
-
-  // ── Normalize edge section (camelCase → snake_case) ─────────────────
-  let edge = serde_json::json!({
-    "host": edge.get("host").cloned().unwrap_or_default(),
-    "port": edge.get("port").cloned().unwrap_or_default(),
-    "edge_id": edge.get("edgeId").or_else(|| edge.get("edge_id")).cloned(),
-    "server_name": edge.get("serverName").or_else(|| edge.get("server_name")).cloned(),
-  });
-
-  // ── Identity (local only — no user info from share) ─────────────────
-  let hostname = get_hostname();
-  let identity = serde_json::json!({
-    "device_id": local_device_id,
-    "hostname": hostname,
-  });
-
-  // ── Network section ─────────────────────────────────────────────────
-  let network_id = network
-    .get("networkId")
-    .or_else(|| network.get("network_id"))
-    .and_then(|v| v.as_str())
-    .unwrap_or("")
-    .trim()
-    .to_string();
-  if network_id.is_empty() {
-    anyhow::bail!("share.json 'network' section missing networkId");
-  }
-
-  let invite_token = network
-    .get("inviteToken")
-    .or_else(|| network.get("invite_token"))
-    .and_then(|v| v.as_str())
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty());
-
-  let mut network_json = serde_json::json!({
-    "network_id": network_id,
-  });
-  if let Some(ref token) = invite_token {
-    network_json["invite_token"] = serde_json::json!(token);
-  }
-
-  // ── Write config.json ───────────────────────────────────────────────
-  let config = serde_json::json!({
-    "edge": edge,
-    "identity": identity,
-    "network": network_json,
-  });
-  std::fs::write(
-    config_dir.join("config.json"),
-    serde_json::to_string_pretty(&config)?,
-  )?;
-
-  // ── Certificates ────────────────────────────────────────────────────
-  let certs_dir = config_dir.join("certs");
-  std::fs::create_dir_all(&certs_dir)?;
-
-  // Always write CA cert
-  write_cert_if_present(&certs_dir, "ca.crt", certificates, "caCert")?;
-
-  if is_full_cert_mode {
-    // Full cert mode: import client cert + key
-    write_cert_if_present(&certs_dir, "client.crt", certificates, "clientCert")?;
-    write_cert_if_present(&certs_dir, "client.key", certificates, "clientKey")?;
-    info!("Imported full certificate bundle.");
-  } else {
-    // Token mode: only CA cert; remove any stale client cert/key from a previous import
-    let _ = std::fs::remove_file(certs_dir.join("client.crt"));
-    let _ = std::fs::remove_file(certs_dir.join("client.key"));
-    info!("Imported CA certificate (client cert will be bootstrapped via invite token on serve).");
-  }
-
-  info!("Import complete. Config written to {}", config_dir.display());
-  println!("✓ Network package imported successfully.");
-  println!("  Device ID: {local_device_id}");
-  if is_full_cert_mode {
-    println!("  Mode: Full certificates (ready to connect).");
-  } else {
-    println!("  Mode: Invite token (certificate will be obtained on first connect).");
-  }
-  println!("  Run `yat-cli serve` to connect.");
-  Ok(())
+pub async fn run(file: &Path) -> Result<()> {
+  let mut content = String::new();
+  std::fs::File::open(file)?
+    .take((MAX_IMPORT + 1) as u64)
+    .read_to_string(&mut content)?;
+  validate_content(&content)?;
+  crate::client_owner::dispatch(crate::client_owner::Command::Import { content }).await
 }
 
-/// Read or create a stable local device ID persisted in `config_dir/device-id`.
-///
-/// The ID format is `device-{32 hex chars}` (matching the desktop convention).
-/// On first call a new ID is generated from `/dev/urandom` and written to disk.
-/// Subsequent calls (or re-imports) return the same ID so the edge sees one
-/// stable peer per physical device.
-fn get_or_create_local_device_id(config_dir: &Path) -> Result<String> {
-  let path = config_dir.join("device-id");
-  if let Ok(existing) = std::fs::read_to_string(&path) {
-    let trimmed = existing.trim().to_string();
-    if trimmed.starts_with("device-") && trimmed.len() == 39 {
-      return Ok(trimmed);
+/// Validate before stopping the current generation. This function never writes.
+pub(crate) fn validate_content(content: &str) -> Result<serde_json::Value> {
+  anyhow::ensure!(content.len() <= MAX_IMPORT, "Share package exceeds 256 KiB");
+  let share: serde_json::Value = serde_json::from_str(content)?;
+  let required = |section: &str, key: &str, alias: &str| -> Result<&str> {
+    share
+      .get(section)
+      .and_then(|v| v.get(key).or_else(|| v.get(alias)))
+      .and_then(|v| v.as_str())
+      .map(str::trim)
+      .filter(|s| !s.is_empty())
+      .with_context(|| format!("Missing or empty {section}.{key}"))
+  };
+  required("edge", "host", "host")?;
+  let port = share["edge"]["port"]
+    .as_u64()
+    .context("Invalid edge.port")?;
+  anyhow::ensure!(port > 0 && port <= u16::MAX as u64, "Invalid edge.port");
+  required("network", "networkId", "network_id")?;
+  required("certificates", "caCert", "caCert")?;
+  let cert = share["certificates"].get("clientCert");
+  let key = share["certificates"].get("clientKey");
+  if cert.is_some() || key.is_some() {
+    required("certificates", "clientCert", "clientCert")?;
+    required("certificates", "clientKey", "clientKey")?;
+  } else {
+    required("network", "inviteToken", "invite_token")?;
+  }
+  // Deserialize the exact normalized configuration before changing disk state.
+  let _: crate::config::AppConfig = serde_json::from_value(normalize(&share, "validation-device"))?;
+  Ok(share)
+}
+
+fn normalize(share: &serde_json::Value, device_id: &str) -> serde_json::Value {
+  let edge = &share["edge"];
+  let network = &share["network"];
+  serde_json::json!({
+    "edge": { "host": edge["host"], "port": edge["port"],
+      "edge_id": edge.get("edgeId").or_else(|| edge.get("edge_id")),
+      "server_name": edge.get("serverName").or_else(|| edge.get("server_name")) },
+    "identity": { "device_id": device_id, "hostname": crate::config::get_hostname() },
+    "network": { "network_id": network.get("networkId").or_else(|| network.get("network_id")),
+      "invite_token": network.get("inviteToken").or_else(|| network.get("invite_token")) }
+  })
+}
+
+/// Called only while the process lock is held and the previous generation drained.
+pub(crate) fn import_content(content: &str) -> Result<()> {
+  let share = validate_content(content)?;
+  let directory = crate::config::config_dir();
+  let certs = directory.join("certs");
+  std::fs::create_dir_all(&certs)?;
+  std::fs::set_permissions(&certs, std::fs::Permissions::from_mode(0o700))?;
+  let identity_file = directory.join("device-id");
+  let device_id = match std::fs::read_to_string(&identity_file) {
+    Ok(id) if id.trim().starts_with("device-") && id.trim().len() == 39 => id.trim().to_owned(),
+    _ => {
+      let mut bytes = [0u8; 16];
+      std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+      let id = format!(
+        "device-{}",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+      );
+      write_private(&identity_file, id.as_bytes())?;
+      id
+    }
+  };
+  let config = serde_json::to_vec_pretty(&normalize(&share, &device_id))?;
+  // A failed multi-file publication blocks subsequent startup until a complete
+  // import succeeds. Never connect using a mixed old/new certificate bundle.
+  let marker = directory.join("import.pending");
+  write_private(&marker, b"Incomplete import; re-import share package")?;
+  for (filename, field) in [
+    ("ca.crt", "caCert"),
+    ("client.crt", "clientCert"),
+    ("client.key", "clientKey"),
+  ] {
+    if let Some(value) = share["certificates"][field].as_str() {
+      write_private(&certs.join(filename), value.as_bytes())?;
+    } else {
+      match std::fs::remove_file(certs.join(filename)) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e.into()),
+      }
     }
   }
-  // Generate a new device ID from 16 random bytes → 32 hex chars.
-  let mut buf = [0u8; 16];
-  if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-    use std::io::Read;
-    let _ = std::io::BufReader::new(&mut f).read_exact(&mut buf);
-  } else {
-    // Fallback: use process id + timestamp for uniqueness.
-    let ts = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .unwrap_or_default()
-      .as_nanos();
-    let pid = std::process::id() as u128;
-    buf[..8].copy_from_slice(&ts.to_le_bytes());
-    buf[8..10].copy_from_slice(&pid.to_le_bytes());
+  write_private(&directory.join("config.json"), &config)?;
+  // Remove stale WireGuard identity (keypair + per-network state) so the next
+  // connect generates a fresh keypair. Without this, re-importing after peer
+  // deletion reuses the old public key, causing handshake failures when the
+  // frontend re-added the peer with a different key.
+  let wg_dir = directory.join("wireguard");
+  if wg_dir.exists() {
+    std::fs::remove_dir_all(&wg_dir)?;
   }
-  let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-  let device_id = format!("device-{hex}");
-  std::fs::write(&path, &device_id)?;
-  info!("Generated new local device ID: {device_id}");
-  Ok(device_id)
-}
-
-fn config_dir() -> std::path::PathBuf {
-  let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-  std::path::PathBuf::from(home).join(".config/yat-cli")
-}
-
-fn get_hostname() -> String {
-  std::fs::read_to_string("/etc/hostname")
-    .ok()
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
-    .or_else(|| std::env::var("HOSTNAME").ok())
-    .unwrap_or_else(|| "yat-cli-linux".to_string())
-}
-
-fn write_cert_if_present(
-  dir: &Path,
-  filename: &str,
-  certificates: &serde_json::Value,
-  key: &str,
-) -> Result<()> {
-  if let Some(value) = certificates.get(key).and_then(|v| v.as_str()) {
-    std::fs::write(dir.join(filename), value)?;
-    info!("Wrote certificate: {}", filename);
-  }
+  std::fs::remove_file(marker)?;
+  println!("Network package imported successfully.");
   Ok(())
+}
+
+fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+  let temporary = path.with_extension("import-tmp");
+  let mut file = std::fs::OpenOptions::new()
+    .write(true)
+    .create(true)
+    .truncate(true)
+    .mode(0o600)
+    .custom_flags(libc::O_NOFOLLOW)
+    .open(&temporary)?;
+  file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+  file.write_all(data)?;
+  file.sync_all()?;
+  std::fs::rename(temporary, path)?;
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  #[test]
+  fn rejects_invalid_import_before_any_write() {
+    let valid = serde_json::json!({"edge":{"host":"edge.test","port":443},
+      "network":{"networkId":"net","inviteToken":"token"},"certificates":{"caCert":"ca"}});
+    assert!(validate_content(&valid.to_string()).is_ok());
+    for (section, field, value) in [
+      ("edge", "port", serde_json::json!(65536)),
+      ("network", "networkId", serde_json::json!("")),
+      ("certificates", "clientCert", serde_json::json!("cert")),
+    ] {
+      let mut invalid = valid.clone();
+      invalid[section][field] = value;
+      assert!(validate_content(&invalid.to_string()).is_err());
+    }
+    assert!(validate_content(&"x".repeat(MAX_IMPORT + 1)).is_err());
+  }
 }

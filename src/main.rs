@@ -1,4 +1,5 @@
 mod cli;
+mod client_owner;
 mod config;
 mod daemon;
 mod gather;
@@ -6,10 +7,14 @@ mod managers;
 mod web;
 
 use clap::{Parser, Subcommand};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
-#[command(name = "yat-client", version, about = "YAT Linux WireGuard client")]
+#[command(
+  name = "yat-client",
+  version,
+  about = "YAT WireGuard client for Linux servers"
+)]
 struct Cli {
   #[command(subcommand)]
   command: Commands,
@@ -39,26 +44,23 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
-  // ── Pre-runtime signal blocking for `serve` ─────────────────────────
-  // `#[tokio::main]` spawns worker threads BEFORE the function body runs.
-  // Those workers inherit the process signal mask with SIGINT *unblocked*,
-  // so the kernel delivers Ctrl+C to a tokio worker (default = terminate)
-  // and the sigwait cleanup thread never fires.
-  //
-  // Fix: block SIGINT/SIGTERM *here*, before the tokio runtime is created.
-  // All subsequently spawned threads (including tokio workers) inherit the
-  // blocked mask, ensuring only the dedicated sigwait thread can catch the
-  // signal and run the WireGuard cleanup.
-  //
-  // Only applied to `serve` — other commands use `tokio::signal::ctrl_c()`.
-  let is_serve = std::env::args().any(|a| a == "serve");
-  if is_serve {
+  let cli = Cli::parse();
+  if matches!(cli.command, Commands::Start | Commands::Serve { .. }) {
+    yat_wireguard::platform::ensure_platform_kernel_support()?;
+  }
+  // Block before creating any runtime threads. The owner signal thread only
+  // notifies the same supervisor; native cleanup stays on the original runtime.
+  if matches!(
+    cli.command,
+    Commands::Start | Commands::Serve { .. } | Commands::Leave | Commands::Import { .. }
+  ) {
     unsafe {
       let mut set: libc::sigset_t = std::mem::zeroed();
       libc::sigemptyset(&mut set);
       libc::sigaddset(&mut set, libc::SIGINT);
       libc::sigaddset(&mut set, libc::SIGTERM);
-      libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+      let error = libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+      anyhow::ensure!(error == 0, "Cannot block shutdown signals: {error}");
     }
   }
 
@@ -75,10 +77,8 @@ fn main() -> anyhow::Result<()> {
       .with_env_filter(EnvFilter::from_default_env().add_directive("yat_cli=info".parse()?))
       .init();
 
-    let cli = Cli::parse();
-
     match cli.command {
-      Commands::Import { file } => cli::import::run(&file),
+      Commands::Import { file } => cli::import::run(&file).await,
       Commands::Start => cli::start::run().await,
       Commands::Status => cli::status::run(),
       Commands::Leave => cli::leave::run().await,

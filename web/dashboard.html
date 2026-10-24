@@ -232,6 +232,11 @@
       return `<div class="kv-row"><span class="kv-label">${label}:</span><span class="kv-value">${value || '—'}</span></div>`;
     }
     function truncate(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : s; }
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[c]));
+    }
     function timeAgo(iso) {
       if (!iso) return '—';
       const d = new Date(iso), now = new Date();
@@ -308,21 +313,23 @@
 
         // Peers (full key, no truncation)
         const peers = peersRes.peers || [];
-        $('#peer-count-badge').textContent = peers.length + ' online';
+        $('#peer-count-badge').textContent = peers.length + ' peers';
         if (peers.length === 0) {
-          $('#peers-table').innerHTML = '<p class="text-zinc-500 text-sm">No peers connected</p>';
+          $('#peers-table').innerHTML = '<p class="text-zinc-500 text-sm">No peers</p>';
         } else {
           let html = '<table class="w-full text-xs"><thead><tr class="text-zinc-500 text-left">';
-          html += '<th class="pb-2 pr-3">Hostname</th><th class="pb-2 pr-3">IP</th><th class="pb-2 pr-3">Endpoint</th><th class="pb-2 pr-3">Handshake</th><th class="pb-2">Public Key</th></tr></thead><tbody>';
+          html += '<th class="pb-2 pr-3">Hostname</th><th class="pb-2 pr-3">IP</th><th class="pb-2 pr-3 whitespace-nowrap" title="Local WireGuard path; does not indicate end-to-end reachability">Local Path</th><th class="pb-2 pr-3 whitespace-nowrap">Path Endpoint</th><th class="pb-2 pr-3 whitespace-nowrap" title="Handshake with the carrying WireGuard peer, including the relay for Relay paths">Path Handshake</th><th class="pb-2">Public Key</th></tr></thead><tbody>';
           peers.forEach(p => {
+            const path = p.local_path === 'direct' ? 'Direct' : p.local_path === 'relay' ? 'Relay' : 'Unknown';
             const ep = p.endpoint || '—';
             const hs = p.last_handshake_at ? formatHandshake(p.last_handshake_at) : '—';
             html += `<tr class="border-t border-zinc-800">`;
-            html += `<td class="py-1.5 pr-3 text-zinc-200">${p.hostname || '—'}</td>`;
-            html += `<td class="py-1.5 pr-3 text-zinc-300">${p.assigned_ip}</td>`;
-            html += `<td class="py-1.5 pr-3 text-zinc-400">${truncate(ep, 24)}</td>`;
+            html += `<td class="py-1.5 pr-3 text-zinc-200">${escapeHtml(p.hostname || '—')}</td>`;
+            html += `<td class="py-1.5 pr-3 text-zinc-300">${escapeHtml(p.assigned_ip)}</td>`;
+            html += `<td class="py-1.5 pr-3 text-zinc-300">${path}</td>`;
+            html += `<td class="py-1.5 pr-3 text-zinc-400 whitespace-nowrap">${escapeHtml(ep)}</td>`;
             html += `<td class="py-1.5 pr-3 text-zinc-400">${hs}</td>`;
-            html += `<td class="py-1.5 text-zinc-500 font-mono">${p.public_key || '—'}</td>`;
+            html += `<td class="py-1.5 text-zinc-500 font-mono">${escapeHtml(p.public_key || '—')}</td>`;
             html += `</tr>`;
           });
           html += '</tbody></table>';

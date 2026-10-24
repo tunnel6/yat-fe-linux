@@ -19,6 +19,12 @@ use tracing::{info, warn};
 
 use yat_transport::{EdgeClient, WGP2PEvent};
 
+fn scoped_network_id(session_id: &str) -> Option<&str> {
+  session_id
+    .strip_prefix("lan:")
+    .filter(|network_id| !network_id.is_empty())
+}
+
 // ─── Local address collection ────────────────────────────────────────────────
 
 /// Collect non-loopback IPv4 addresses from system network interfaces.
@@ -97,7 +103,10 @@ async fn handle_gather(
   // Filter out the WG TUN self address (e.g. 10.24.0.8) — it's a virtual IP,
   // not a real LAN address that peers can use for same-NAT communication.
   let local_addrs: Vec<String> = if !self_address.is_empty() {
-    local_addrs.into_iter().filter(|a| a != self_address).collect()
+    local_addrs
+      .into_iter()
+      .filter(|a| a != self_address.split('/').next().unwrap_or(self_address))
+      .collect()
   } else {
     local_addrs
   };
@@ -137,8 +146,8 @@ async fn handle_gather(
       session_id,
       client_id,
       &local_addrs,
-      "",  // public_addr — not needed for same-NAT gather
-      0,   // nat_type — unknown
+      "", // public_addr — not needed for same-NAT gather
+      0,  // nat_type — unknown
       &local_wg_endpoint,
     )
     .await
@@ -155,53 +164,78 @@ async fn handle_gather(
 ///
 /// Call this after the Edge connection is established and the WG identity
 /// is loaded.  The subscription lives as long as the `EdgeClient`.
+pub struct Subscription {
+  stop: tokio::sync::watch::Sender<bool>,
+  task: tokio::task::JoinHandle<()>,
+  failed: bool,
+}
+impl Subscription {
+  pub async fn stop(&mut self) -> anyhow::Result<()> {
+    anyhow::ensure!(
+      !self.failed,
+      "Gather task previously failed; ownership retained"
+    );
+    self.stop.send_replace(true);
+    if let Err(error) = (&mut self.task).await {
+      self.failed = true;
+      anyhow::bail!("Gather task failed: {error}");
+    }
+    Ok(())
+  }
+}
+
 pub async fn subscribe_p2p_events(
   edge: Arc<EdgeClient>,
   client_id: String,
   storage_dir: String,
   network_id: String,
   self_address: String,
-) {
-  let storage_dir = Arc::new(storage_dir);
-  let network_id = Arc::new(network_id);
-  let self_address = Arc::new(self_address);
-
-  let handler_edge = Arc::clone(&edge);
-  let handler = move |event: WGP2PEvent| {
-    let edge = Arc::clone(&handler_edge);
-    let client_id = client_id.clone();
-    let storage_dir = Arc::clone(&storage_dir);
-    let network_id = Arc::clone(&network_id);
-    let self_address = Arc::clone(&self_address);
-
-    match event {
-      WGP2PEvent::Gather { session_id } => {
-        tokio::spawn(async move {
-          handle_gather(&edge, &session_id, &client_id, &storage_dir, &network_id, &self_address).await;
-        });
-      }
-      WGP2PEvent::Punch { session_id, client_id: peer_client_id, punch_addrs } => {
-        // For same-NAT, punch is a no-op — the WG interface will auto-handshake
-        // once both peers have each other's LAN endpoint from the gather flow.
-        // Report success so Edge knows the punch addresses are reachable.
-        info!("[P2P] punch: session_id={session_id}, peer={peer_client_id}, addrs={punch_addrs:?}");
-        let edge = Arc::clone(&edge);
-        tokio::spawn(async move {
-          let connected_addr = punch_addrs.first().cloned().unwrap_or_default();
-          if let Err(e) = edge
-            .send_wg_punch_response(&session_id, &peer_client_id, true, &connected_addr)
-            .await
-          {
-            warn!("[P2P] punch: failed to send response: {e}");
+) -> anyhow::Result<Subscription> {
+  let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+  let scope = network_id.clone();
+  edge
+    .subscribe_wg_p2p_events(move |event| {
+      if let WGP2PEvent::Gather { session_id } = event {
+        if scoped_network_id(&session_id) == Some(scope.as_str()) {
+          if tx.try_send(session_id).is_err() {
+            warn!("Gather queue full or stopping; event dropped");
           }
-        });
+        }
+      }
+    })
+    .await?;
+  let (stop, mut stopping) = tokio::sync::watch::channel(false);
+  let task = tokio::spawn(async move {
+    loop {
+      if *stopping.borrow() {
+        break;
+      }
+      tokio::select! {
+        biased;
+        _ = stopping.changed() => break,
+        session = rx.recv() => match session {
+          Some(session) => handle_gather(&edge, &session, &client_id, &storage_dir, &network_id, &self_address).await,
+          None => break,
+        }
       }
     }
-  };
+    // In-flight stats/response completed above; queued events are discarded.
+  });
+  Ok(Subscription {
+    stop,
+    task,
+    failed: false,
+  })
+}
 
-  if let Err(e) = edge.subscribe_wg_p2p_events(handler).await {
-    warn!("[P2P] failed to subscribe P2P events: {e}");
-  } else {
-    info!("[P2P] P2P event handler subscribed (gather/punch enabled)");
+#[cfg(test)]
+mod tests {
+  use super::scoped_network_id;
+
+  #[test]
+  fn legacy_event_scope_requires_explicit_network_id() {
+    assert_eq!(scoped_network_id("lan:net-a"), Some("net-a"));
+    assert_eq!(scoped_network_id("lan:"), None);
+    assert_eq!(scoped_network_id("gather:session"), None);
   }
 }

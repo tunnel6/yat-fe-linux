@@ -7,9 +7,9 @@ use axum::{
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
-use yat_transport::EdgeClient;
+use crate::client_owner::{Command, Handle};
 
 use crate::config::AppConfig;
 use crate::daemon::loop_runner::{LogBuffer, SyncState};
@@ -23,17 +23,13 @@ pub struct AppState {
   pub logs: Arc<Mutex<LogBuffer>>,
   pub config: Arc<Mutex<Option<Arc<AppConfig>>>>,
   pub cert_manager: Arc<CertManager>,
-  /// Trigger a service restart (config reload + Edge reconnect).
-  pub restart_tx: Arc<tokio::sync::mpsc::Sender<()>>,
-  /// Wake up the reconnect loop for manual reconnect.
-  pub reconnect_notify: Arc<tokio::sync::Notify>,
-  /// Edge client reference (set after successful Edge connection).
-  pub edge_client: Arc<Mutex<Option<Arc<EdgeClient>>>>,
+  pub client_owner: Handle,
 }
 
 // ─── Server entry point ─────────────────────────────────────────────────────
 
 pub async fn start(listen: &str, app_state: AppState) -> Result<()> {
+  let mut shutdown = app_state.client_owner.shutdown_receiver();
   let app = Router::new()
     .route("/", get(index_handler))
     .route("/tailwindcss.js", get(static_handler))
@@ -51,10 +47,13 @@ pub async fn start(listen: &str, app_state: AppState) -> Result<()> {
   let listener = tokio::net::TcpListener::bind(listen).await?;
   info!("Web UI listening on http://{}", listen);
 
-  // Graceful shutdown is handled by the OS-level signal thread in serve.rs,
-  // which calls process::exit(0) on SIGINT. No need for with_graceful_shutdown
-  // here because tokio::signal::ctrl_c() is unreliable under sudo.
-  axum::serve(listener, app).await?;
+  axum::serve(listener, app)
+    .with_graceful_shutdown(async move {
+      if !*shutdown.borrow() {
+        let _ = shutdown.changed().await;
+      }
+    })
+    .await?;
 
   info!("Web UI shut down gracefully.");
   Ok(())
@@ -193,36 +192,27 @@ async fn api_import(
 ) -> Json<serde_json::Value> {
   let content = match body.get("content").and_then(|v| v.as_str()) {
     Some(c) => c,
-    None => return Json(serde_json::json!({ "success": false, "error": "Missing 'content' field" })),
+    None => {
+      return Json(serde_json::json!({ "success": false, "error": "Missing 'content' field" }))
+    }
   };
 
-  // Write content to a temp file, then delegate to import::run
-  let tmp = std::env::temp_dir().join("yat-cli-import.json");
-  if let Err(e) = std::fs::write(&tmp, content) {
-    return Json(serde_json::json!({ "success": false, "error": format!("Failed to write temp file: {e}") }));
-  }
+  command_reply(
+    &state,
+    Command::Import {
+      content: content.to_owned(),
+    },
+  )
+  .await
+}
 
-  match crate::cli::import::run(&tmp) {
-    Ok(()) => {
-      let _ = std::fs::remove_file(&tmp);
-
-      // Reload config in background
-      {
-        let mut cfg = state.config.lock().await;
-        *cfg = crate::config::load_config().ok().map(Arc::new);
-      }
-
-      state.logs.lock().await.push("INFO", "Import successful, restarting service...".into());
-
-      // Trigger restart (config reload + Edge reconnect)
-      let _ = state.restart_tx.send(()).await;
-
-      Json(serde_json::json!({ "success": true, "message": "Import successful. Restarting service..." }))
-    }
-    Err(e) => {
-      let _ = std::fs::remove_file(&tmp);
-      Json(serde_json::json!({ "success": false, "error": e.to_string() }))
-    }
+async fn command_reply(state: &AppState, command: Command) -> Json<serde_json::Value> {
+  match state.client_owner.request(command).await {
+    Ok(reply) => Json(
+      serde_json::json!({"success":reply.success,"message":reply.message,
+      "error":if reply.success { None } else { Some(reply.message) }}),
+    ),
+    Err(error) => Json(serde_json::json!({"success":false,"error":format!("{error:#}")})),
   }
 }
 
@@ -237,16 +227,8 @@ async fn api_reconnect(State(state): State<AppState>) -> Json<serde_json::Value>
       "message": "Already connected.",
     }));
   }
-  // Wake up the reconnect loop
-  state.reconnect_notify.notify_one();
-  // Clear the scheduled reconnect time
   drop(s);
-  let mut s = state.sync.lock().await;
-  s.reconnect_at = None;
-  Json(serde_json::json!({
-    "success": true,
-    "message": "Reconnect triggered. Check status in a few seconds.",
-  }))
+  command_reply(&state, Command::Start {}).await
 }
 
 /// POST /api/address — update this device's IP address in the network.
@@ -257,43 +239,18 @@ async fn api_update_address(
   State(state): State<AppState>,
   Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-  let new_ip = match body.get("new_ip").and_then(|v| v.as_str()).map(|s| s.trim().to_string()) {
+  let new_ip = match body
+    .get("new_ip")
+    .and_then(|v| v.as_str())
+    .map(|s| s.trim().to_string())
+  {
     Some(ip) if !ip.is_empty() => ip,
-    _ => return Json(serde_json::json!({ "success": false, "error": "Missing or empty 'new_ip' field" })),
+    _ => {
+      return Json(
+        serde_json::json!({ "success": false, "error": "Missing or empty 'new_ip' field" }),
+      )
+    }
   };
 
-  let (network_id, member_id) = {
-    let s = state.sync.lock().await;
-    (s.network_id.clone(), s.member_id.clone())
-  };
-  if network_id.is_empty() || member_id.is_empty() {
-    return Json(serde_json::json!({ "success": false, "error": "Not connected to any network" }));
-  }
-
-  let edge_client = {
-    let guard = state.edge_client.lock().await;
-    guard.clone()
-  };
-  let Some(client) = edge_client else {
-    return Json(serde_json::json!({ "success": false, "error": "Edge client not available" }));
-  };
-
-  match client.update_wg_member(&network_id, &member_id, &new_ip, "").await {
-    Ok(resp) if resp.success => {
-      // Update local state so dashboard reflects the new address immediately
-      let mut s = state.sync.lock().await;
-      s.self_address = new_ip.clone();
-      info!("Address updated to {new_ip}");
-      state.logs.lock().await.push("INFO", format!("Address updated to {new_ip}"));
-      Json(serde_json::json!({ "success": true, "message": format!("Address updated to {new_ip}") }))
-    }
-    Ok(_resp) => {
-      warn!("Address update failed: member_id={member_id}, new_ip={new_ip}");
-      Json(serde_json::json!({ "success": false, "error": "Edge rejected the update" }))
-    }
-    Err(e) => {
-      warn!("Address update error: {e}");
-      Json(serde_json::json!({ "success": false, "error": format!("Update failed: {e}") }))
-    }
-  }
+  command_reply(&state, Command::UpdateAddress { new_ip }).await
 }

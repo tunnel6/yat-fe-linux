@@ -1,10 +1,21 @@
-# YAT Linux Client Release Notes
+# YAT Linux Server Client Release Notes
 
-YAT Linux Client (`yat-client`) is the native Linux client for the YAT platform, built with Rust. It provides WireGuard networking capabilities and a built-in Web Dashboard for management. Supports both x86_64 and arm64 architectures, deployable via Docker or standalone binary.
+> Current source (2026-10-19): Docker runs `yat-client serve` in the foreground by default, including the Web Dashboard at `0.0.0.0:9909` inside the container. See [README](README.md) for deployment and shutdown details. Historical release entries do not imply that native path coordination is enabled or validated on real devices.
+
+The YAT Linux Server client (`yat-client`, directory `yat-fe-linux`) is a standalone Rust CLI/service for Linux servers. It is separate from the Electron Linux desktop build in `yat-fe`. It provides WireGuard networking capabilities and a built-in Web Dashboard for management. Supports both x86_64 and arm64 architectures, deployable via Docker or standalone binary.
 
 ---
 
 ## Changelog
+
+### Current source / Unreleased (2026-10-19)
+
+- Server `start/serve/leave/import` and Web operations use the same `client_owner`. A permanent lock file and private `yat-fe-linux.sock` prevent a second native configuration writer for the same directory. Desktop Linux does not use this Server IPC/Docker lifecycle.
+- Initial apply, refresh, reconnect, import replacement and shutdown use the owned controller. Shutdown fences writes and closes the Edge control connection before awaiting original tasks and native cleanup. Failed cleanup retains ownership and retries. Ordinary stop preserves membership; explicit `leave` changes it.
+- Both Linux products require kernel **≥ 5.6**, including Docker's host kernel. Distribution backports to 5.4 are outside the supported baseline; installed tools do not replace kernel support or privileges.
+- The exec ENTRYPOINT runs foreground `serve` by default; override with `start` to omit Web. The Web management API currently has no authentication. Limit it to a trusted management boundary; examples below publish only to host loopback.
+- SIGKILL, crashes and host failures cannot guarantee exit callbacks. Edge detects disconnection/timeouts; cleanup does not depend on the exit status code.
+- Native path coordination has controlled implementations and offline regressions. Production Owner/PathControlSession assembly, authoritative manual requests, automatic stability policy and real-device acceptance remain incomplete; the capability is unpublished. See the [current code plan, §25](../docs/wireguard/WIREGUARD_NATIVE_PATH_COORDINATION_CODE_PLAN_2026-10-17.md).
 
 ### v0.2.0 (2026-10-16)
 
@@ -19,7 +30,7 @@ YAT Linux Client (`yat-client`) is the native Linux client for the YAT platform,
 - In token mode, the client automatically requests a certificate from the Edge via invite token on first startup
 - After certificate expiry, re-export a new share package from the desktop app to update
 
-**WireGuard Network Sync Upgrade**
+**WireGuard Network Sync Upgrade (historical local selection; not acceptance of new bilateral coordination)**
 - Powered by a new network sync engine with:
   - Automatic relay path management (falls back to relay when direct connection is unavailable)
   - Dynamic path switching (direct ↔ relay)
@@ -46,14 +57,16 @@ Get a Linux machine connected to your YAT WireGuard network in three steps:
 
 ```bash
 # 1. Start the client (Docker)
-docker run -d --name yat-client \
+docker run --name yat-client \
+  --stop-timeout 60 \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
-  -p 9909:9909 \
+  -p 127.0.0.1:9909:9909 \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 
 # 2. Open the Dashboard in your browser
-#    http://<your-linux-ip>:9909
+#    http://127.0.0.1:9909 (use SSH forwarding for remote access)
 
 # 3. Upload share.json in the Settings tab — the client connects automatically
 ```
@@ -67,7 +80,8 @@ docker run -d --name yat-client \
 | Item | Requirement |
 |------|-------------|
 | **OS** | Linux (x86_64 / aarch64) |
-| **Kernel** | WireGuard support (`wireguard-tools`) |
+| **Host kernel** | Linux ≥ 5.6 with built-in or module WireGuard support; 5.4 backports are outside the baseline |
+| **Tools** | `iproute2`, `wireguard-tools`; tools do not replace kernel support |
 | **Docker** | Docker 20.10+ (when running via Docker) |
 | **Privileges** | `root` or `CAP_NET_ADMIN` (required for WireGuard interface creation) |
 | **Network** | Reachable YAT Edge server (port determined by Edge config) |
@@ -76,7 +90,7 @@ docker run -d --name yat-client \
 ### Additional Docker Permissions
 
 ```bash
-# WireGuard requires TUN device and network management capabilities
+# Keep deployment device access; Linux uses kernel WireGuard and requires NET_ADMIN
 --cap-add NET_ADMIN \
 --device /dev/net/tun
 ```
@@ -98,17 +112,22 @@ docker pull registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 
 ```bash
 # Basic start (port mapping mode)
-docker run -d --name yat-client \
+docker run --name yat-client \
+  --stop-timeout 60 \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
-  -p 9909:9909 \
+  -p 127.0.0.1:9909:9909 \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 
-# Host network mode (recommended for better performance)
-docker run -d --name yat-client \
+# Optional host networking: bind Web to loopback; do not expose the management API directly
+docker run --name yat-client \
+  --stop-timeout 60 \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   --network host \
+  -e YAT_LISTEN=127.0.0.1:9909 \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 ```
 
@@ -116,22 +135,25 @@ docker run -d --name yat-client \
 
 ```bash
 # Change the Web UI listen port
-docker run -d --name yat-client \
+docker run --name yat-client \
+  --stop-timeout 60 \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest \
-  yat-client serve --listen 0.0.0.0:8080
+  serve --listen 0.0.0.0:8080
 ```
 
 #### Persist Configuration
 
 ```bash
 # Mount config directory to survive container restarts
-docker run -d --name yat-client \
+docker run --name yat-client \
+  --stop-timeout 60 \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
-  -p 9909:9909 \
+  -p 127.0.0.1:9909:9909 \
   -v ~/.config/yat-cli:/root/.config/yat-cli \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 ```
@@ -158,7 +180,7 @@ chmod +x yat-client
 | Command | Description |
 |---------|-------------|
 | `yat-client import <share.json>` | Import a network configuration package |
-| `yat-client serve [--listen ADDR]` | Start daemon with Web Dashboard |
+| `yat-client serve [--listen ADDR]` | Run the foreground owner with Web Dashboard |
 | `yat-client start` | Foreground connection mode (no Web UI) |
 | `yat-client status` | Show current network status |
 | `yat-client leave` | Leave network and teardown WireGuard interface |
@@ -170,17 +192,17 @@ chmod +x yat-client
 # 1. Import network config (share.json exported from desktop app)
 sudo yat-client import share.json
 
-# 2. Start the daemon (default listen: 0.0.0.0:9090)
-sudo yat-client serve
+# 2. Run foreground Web (source default is 0.0.0.0:9909; restrict to loopback here)
+sudo yat-client serve --listen 127.0.0.1:9909
 
 # Or specify a custom listen address
-sudo yat-client serve --listen 0.0.0.0:8080
+sudo yat-client serve --listen 127.0.0.1:8080
 
 # 3. Open the Dashboard in your browser
-#    http://<your-linux-ip>:9090
+#    http://127.0.0.1:9909
 ```
 
-> **Note**: The `import` and `serve` commands require root privileges to create the WireGuard network interface.
+> **Note**: Creating/updating WireGuard interfaces requires root or `CAP_NET_ADMIN`. Without a running owner, `import` only writes configuration. Use the same identity and configuration directory for all commands; a running owner handles import replacement and reconnect.
 
 #### Foreground Mode (No Web UI)
 
@@ -196,30 +218,7 @@ sudo yat-client start
 sudo yat-client status
 ```
 
-Example output:
-
-```
-Network:    net-xxxxxxxxxxxx
-Member:     member-xxxxxxxx
-Interface:  yat0 (userspace)
-Address:    10.0.0.5
-Peers:      3
-Connected:  yes
-
-── WireGuard Engine ──
-Backend:    boringtun
-Interface:  yat0 (userspace)
-Address:    10.0.0.5
-Public key: abcdef1234567890...
-Peers:      3
-
-── Live Stats ──
-Backend:    boringtun (yat0)
-Peers:      3
-  [server-a] ep=1.2.3.4:51820 rx=12.3MB tx=5.6MB
-  [server-b] ep=5.6.7.8:51820 rx=8.1MB tx=3.2MB
-  [server-c] ep=relay.yat.io:443 rx=0.5MB tx=0.3MB
-```
+`status` reads saved membership/interface data, applied state and available native stats. It does not currently query the running owner's control connection, so `Connected: no (daemon mode or stale)` cannot establish that the service is offline. Web `/api/status` reads the running owner's state; its `connected` field still does not prove peer business reachability. Linux uses kernel WireGuard, not boringtun/userspace.
 
 ---
 
@@ -232,14 +231,14 @@ After starting the `serve` command, a feature-rich Web Dashboard is available in
 - **Network Info** — View Network ID, Member ID, assigned IP address, interface name, and other core details
 - **Network Status** — Real-time connection status, online peer count, last sync timestamp
 - **Peers** — Complete peer list with hostname, IP address, endpoint, and RX/TX traffic statistics
-- **Certificate** — Certificate details (Subject / Issuer / Validity / Fingerprint) with one-click renewal
+- **Certificate** — Certificate details (Subject / Issuer / Validity / Fingerprint) with status checks and re-import guidance (no automatic certificate issuance)
 - **Latest Logs** — Last 50 runtime log entries, color-coded by severity (INFO / WARN / ERROR)
 
 ### Settings Tab
 
 - **Edge Connection** — View Edge server host, port, and Edge ID
 - **Identity** — View Device ID and hostname
-- **Import** — Drag-and-drop `share.json` upload; service restarts automatically after import
+- **Import** — Drag-and-drop `share.json` upload; the existing owner drains old resources, updates configuration and reconnects
 - **Reconnect** — Manually trigger Edge reconnection (useful when disconnected)
 - **Update Address** — Dynamically change this device's IP address within the network
 
@@ -261,6 +260,11 @@ Configuration files are stored in `~/.config/yat-cli/`:
 ~/.config/yat-cli/
 ├── config.json   # Main config (Edge connection + device identity + network config)
 ├── device-id     # Local device ID (stable across re-imports)
+├── yat-fe-linux.lock # Permanent lock file; do not remove while running
+├── yat-fe-linux.sock # Private command socket for the current owner
+├── import.pending   # Blocks startup with an incomplete/mixed import
+├── state.json       # Saved connection/interface data, not proof of current presence
+├── wireguard/       # Identity, configuration and applied state
 └── certs/
     ├── ca.crt      # CA certificate
     ├── client.crt  # Client certificate (full cert mode / generated after token bootstrap)
@@ -276,14 +280,14 @@ Configuration files are stored in `~/.config/yat-cli/`:
 | linux/amd64 (x86_64) | ✅ | ✅ |
 | linux/arm64 (aarch64) | ✅ | ✅ |
 
-Docker images are based on Alpine 3.20 (musl libc) for minimal footprint.
+The Dockerfile supports Alpine 3.20 (musl) and Debian bookworm (gnu) variants; the gnu build matrix also includes armv7. Consult the published image manifest for available architectures. This review did not build or run images.
 
 ---
 
 ## FAQ
 
 **Q: Why does it need root privileges?**  
-A: WireGuard requires creating a TUN network interface and configuring routes, which need kernel-level network management permissions.
+A: Linux uses kernel WireGuard. Creating WG interfaces and configuring addresses/routes requires root or CAP_NET_ADMIN in the target network namespace.
 
 **Q: Configuration lost after container restart?**  
 A: Mount a persistent volume with `-v ~/.config/yat-cli:/root/.config/yat-cli`.
@@ -292,4 +296,4 @@ A: Mount a persistent volume with `-v ~/.config/yat-cli:/root/.config/yat-cli`.
 A: Re-export a new share package (full certificate mode or token mode) from the desktop app and import it — the certificate will be updated automatically.
 
 **Q: How to run in the background?**  
-A: Use Docker (`docker run -d`), or `nohup sudo yat-client serve &`. You can also create a systemd service unit.
+A: Let Docker or systemd manage the foreground application. Add `-d` to Docker if needed; stop with `docker stop --time 60 yat-client` so SIGTERM reaches the same PID 1 owner. The grace period does not guarantee cleanup completion.

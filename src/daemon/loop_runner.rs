@@ -5,15 +5,27 @@ const LOG_BUFFER_CAP: usize = 200;
 
 // ─── Shared types ────────────────────────────────────────────────────────────
 
+/// Local WireGuard route ownership, independent of mode and reachability.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPath {
+  #[default]
+  Unknown,
+  Direct,
+  Relay,
+}
+
 /// A single peer's information for the dashboard.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PeerInfo {
   pub hostname: String,
   pub assigned_ip: String,
+  pub local_path: LocalPath,
+  /// Live endpoint of the WireGuard peer carrying traffic to assigned_ip.
   pub endpoint: String,
   pub public_key: String,
   pub presence_status: u8,
-  /// Epoch millis of last successful WireGuard handshake, or None if unknown.
+  /// Handshake with the carrying peer (the relay for a Relay path).
   pub last_handshake_at: Option<f64>,
 }
 
