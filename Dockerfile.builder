@@ -1,9 +1,5 @@
 # syntax=docker/dockerfile:1
-# ── YAT CI Builder Image ─────────────────────────────────────────────────────
-# Pre-installs all build tools for cross-compilation.
-# Build:  docker build -f Dockerfile.builder -t registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:builder .
-# Push:   docker push registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:builder
-#
+
 FROM rust:1.98
 
 ARG ZIG_VERSION=0.16.0
@@ -24,8 +20,6 @@ RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${Z
     chmod +x /usr/local/bin/zig
 
 # ── Rustup mirror (CN) + stable toolchain ───────────────────────────────────
-ENV RUSTUP_DIST_SERVER=https://rsproxy.cn
-ENV RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
 RUN rustup toolchain install stable --profile minimal --no-self-update && \
     rustup default stable && \
     rustup target add x86_64-unknown-linux-gnu && \
