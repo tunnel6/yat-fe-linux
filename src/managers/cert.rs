@@ -21,13 +21,7 @@ impl CertManager {
   /// Load mTLS certificates for Edge connections.
   /// Returns (ca_cert, client_cert, client_key) as PEM bytes.
   pub fn load_edge_certs(&self) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let dir = self.certs_dir();
-    let ca_cert = std::fs::read(dir.join("ca.crt")).context("Failed to read ca.crt")?;
-    let client_cert =
-      std::fs::read(dir.join("client.crt")).context("Failed to read client.crt")?;
-    let client_key =
-      std::fs::read(dir.join("client.key")).context("Failed to read client.key")?;
-    Ok((ca_cert, client_cert, client_key))
+    yat_network::edge::cert::CertManager::new(&self.certs_dir()).load_edge_certs()
   }
 
   /// Inspect the client certificate and return structured info.
@@ -76,15 +70,14 @@ impl CertManager {
 
   /// Check if a client certificate exists on disk.
   pub fn has_client_cert(&self) -> bool {
-    self.certs_dir().join("client.crt").exists()
-      && self.certs_dir().join("client.key").exists()
+    yat_network::edge::cert::CertManager::new(&self.certs_dir()).has_client_cert()
   }
 
   /// Bootstrap a client certificate from the Edge using an invite token.
   ///
   /// Creates a one-way TLS connection (no client cert), sends a `CertRequest`
   /// with the invite token, and stores the returned certificate + key.
-  /// Edge signs via EdgeCA locally — no OAuth needed.
+  /// Edge signs device certificates with its local CA.
   pub async fn bootstrap_certificate(
     &self,
     edge_config: &crate::config::EdgeConfig,
@@ -117,7 +110,7 @@ impl CertManager {
     );
 
     let result = match client
-      .request_certificate("", "", "", device_id, invite_token, &[])
+      .request_certificate(&format!("invite:{invite_token}"), device_id, &[])
       .await
     {
       Ok(r) => r,
@@ -133,18 +126,20 @@ impl CertManager {
       }
     };
 
-    // Store the certificate and key
+    // Reuse pending-publication protection and restrictive private-key permissions.
     let certs_dir = self.certs_dir();
-    std::fs::create_dir_all(&certs_dir)?;
-    std::fs::write(certs_dir.join("client.crt"), &result.certificate)
-      .context("Failed to write client.crt")?;
-    std::fs::write(certs_dir.join("client.key"), &result.private_key)
-      .context("Failed to write client.key")?;
-    // Update CA cert if the response includes one
-    if !result.ca_certificate.is_empty() {
-      std::fs::write(certs_dir.join("ca.crt"), &result.ca_certificate)
-        .context("Failed to write ca.crt")?;
-    }
+    let ca = if result.ca_certificate.is_empty() {
+      std::fs::read(certs_dir.join("ca.crt"))?
+    } else {
+      result.ca_certificate
+    };
+    let chain = if result.certificate_chain.is_empty() {
+      &result.certificate
+    } else {
+      &result.certificate_chain
+    };
+    yat_network::edge::cert::CertManager::new(&certs_dir)
+      .save_cert_bundle(&ca, chain, &result.private_key)?;
 
     tracing::info!(
       "Certificate obtained and stored (serial: {}, expires: {})",

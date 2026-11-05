@@ -15,12 +15,15 @@
 //! ```
 
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tracing::info;
 
 use yat_network::WgSyncController;
-use yat_transport::{EdgeClient, EdgeClientConfig, WGNetworkRuntimeSnapshotData};
+use yat_transport::{EdgeClient, EdgeClientConfig, TransportError, WGNetworkRuntimeSnapshotData};
 use yat_wireguard::types::LocalIdentityParams;
+
+const EDGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const EDGE_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ─── EdgeJoinContext ─────────────────────────────────────────────────────────
 
@@ -113,7 +116,6 @@ impl WgManager {
   pub async fn connect_edge(&mut self) -> Result<EdgeJoinContext> {
     let device_identity = DeviceIdentity {
       device_id: self.config.identity.device_id.clone(),
-      hostname: self.config.identity.hostname.clone(),
     };
     let hostname = config::get_hostname();
     let storage_dir = self.certs.wg_storage_dir();
@@ -296,7 +298,6 @@ impl WgManager {
   pub async fn leave_saved_member(&mut self, network_id: &str, member_id: &str) {
     let identity = DeviceIdentity {
       device_id: self.config.identity.device_id.clone(),
-      hostname: self.config.identity.hostname.clone(),
     };
     if let Ok(edge) = self
       .create_edge_client(&identity, &config::get_hostname())
@@ -370,29 +371,38 @@ impl WgManager {
 
     // Connect
     info!("Connecting to Edge...");
-    client
-      .connect()
+    let connection = tokio::time::timeout(EDGE_CONNECT_TIMEOUT, client.connect())
       .await
-      .context("Failed to connect to Edge")?;
+      .unwrap_or(Err(TransportError::Timeout));
+    if let Err(error) = connection {
+      let _ = client.disconnect_and_wait().await;
+      return Err(error).context("Failed to connect to Edge (TCP/TLS deadline: 10s)");
+    }
     info!("Edge connection established (mTLS).");
 
     // Authenticate
-    info!("Authenticating...");
     // S2a-A4: advertise path-coordination only when the platform engine supports it.
     let path_activation = yat_wireguard::platform::inspect_platform_apply_support().supported;
-    let auth_result = client
-      .authenticate(
-        "", // no user_id — invite-token cert has network scope
+    let capabilities = yat_network::wg::sync_controller::product::capabilities(
+      vec!["wg".to_string()],
+      path_activation,
+    );
+    info!(device = %device_identity.device_id, path_activation, ?capabilities, "Authenticating...");
+    let auth_result = tokio::time::timeout(
+      EDGE_AUTH_TIMEOUT,
+      client.authenticate(
         &device_identity.device_id,
         hostname,
         env!("CARGO_PKG_VERSION"),
-        &yat_network::wg::sync_controller::product::capabilities(vec!["wg".to_string()], path_activation),
-        1,
-        0,
+        &capabilities,
+        yat_transport::PROTOCOL_MAJOR,
+        yat_transport::PROTOCOL_MINOR,
         &[],
         &[],
-      )
-      .await;
+      ),
+    )
+    .await
+    .unwrap_or(Err(TransportError::Timeout));
     let auth_result = match auth_result {
       Ok(result) => result,
       Err(error) => {
@@ -521,7 +531,9 @@ fn validate_initial_apply(
       && applied.staged_at.is_finite()
       && applied.applied_at.is_finite()
       && applied.staged_at > 0.0
-      && applied.applied_at >= applied.staged_at,
+      // A verified native no-op acknowledges a newer stage while retaining
+      // the actual device apply timestamp, which can precede this stage.
+      && applied.applied_at > 0.0,
     "Applied runtime does not match the initial controller result"
   );
   Ok(())
@@ -611,7 +623,6 @@ mod tests {
       path_pairs: vec![],
       network: WGNetworkDetailData {
         network_id: "net".into(),
-        owner_user_id: "user".into(),
         name: "test".into(),
         description: String::new(),
         subnet: "10.0.0.0/24".into(),
@@ -626,11 +637,11 @@ mod tests {
         created_at: 0,
         updated_at: 0,
         coordinator_edge_id: String::new(),
+        ..Default::default()
       },
       members: vec![WGNetworkMemberData {
         member_id: "member".into(),
         network_id: "net".into(),
-        user_id: "user".into(),
         device_id: "device".into(),
         hostname: "local".into(),
         assigned_ip: "10.0.0.2".into(),
@@ -646,12 +657,14 @@ mod tests {
         observed_endpoint: String::new(),
         observed_at: 0,
         membership_generation: String::new(),
+        ..Default::default()
       }],
       peer_sessions: vec![],
       relay_node: None,
       lan_peer_endpoints: vec![],
       revision: 1,
       collected_at: 1,
+      revision_epoch: "test-epoch".into(),
       path_authority_epoch: String::new(),
       network_policy_revision: 0,
     }
@@ -716,6 +729,9 @@ mod tests {
     };
     assert!(check(true, &valid).is_ok());
     assert!(check(false, &valid).is_err());
+    let mut unchanged = applied();
+    unchanged.staged_at = 200.0;
+    assert!(check(true, &unchanged).is_ok(), "a confirmed no-op preserves its native apply time");
     for index in 0..8 {
       let mut wrong = applied();
       match index {
@@ -724,7 +740,7 @@ mod tests {
         2 => wrong.self_address = "10.0.0.3/24".into(),
         3 => wrong.peer_count = 1,
         4 => wrong.requested_interface_name = "other".into(),
-        5 => wrong.applied_at = 99.0,
+        5 => wrong.applied_at = 0.0,
         6 => wrong.staged_at = f64::NAN,
         _ => wrong.resolved_interface_name.clear(),
       }

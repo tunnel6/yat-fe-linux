@@ -21,8 +21,28 @@ use std::{
 use tokio::sync::{Mutex, Notify};
 use yat_network::wg::sync_controller::PathRole;
 use yat_network::WgSyncController;
-use yat_transport::WGNetworkRuntimeSnapshotData;
+use yat_transport::{TransportError, WGNetworkRuntimeSnapshotData};
 use yat_wireguard::types::RuntimeStats;
+
+// Only a transport failure may replace a live control session automatically.
+// Native IO and Edge authorization/coordination rejections are not evidence
+// that authentication must be rebuilt.
+fn control_connection_failed(error: &anyhow::Error) -> bool {
+  matches!(
+    error.downcast_ref::<TransportError>(),
+    Some(
+      TransportError::Io(_)
+        | TransportError::Tls(_)
+        | TransportError::Connection(_)
+        | TransportError::Timeout
+        | TransportError::NotConnected
+    )
+  )
+}
+
+fn ordinary_snapshot_reconcile_due(event: PendingEvent, last_sync: Duration) -> bool {
+  event == PendingEvent::Refresh || last_sync >= Duration::from_secs(30)
+}
 
 #[derive(Clone)]
 pub struct Shared {
@@ -129,6 +149,11 @@ impl Runtime {
     }
     if let Some(manager) = self.manager.as_mut() {
       if let Some(edge) = manager.edge_client() {
+        if let Some(controller)=&self.controller {
+          if let Ok((edge_id,session_id))=edge.authenticated_event_source().await {
+            controller.events.retire_source(&yat_network::events::EventSource {edge_id,session_id});
+          }
+        }
         edge.unsubscribe_wg_network_events().await?;
         edge.unsubscribe_wg_p2p_events().await?;
       }
@@ -161,7 +186,16 @@ impl Runtime {
         Err(error)
       }
     })?;
-    *self.shared.sync.lock().await = SyncState::empty();
+    let mut state = self.shared.sync.lock().await;
+    // A delayed native drain can finish on a later supervisor tick. Keep the
+    // already scheduled retry visible until success or explicit Leave/Import.
+    let reconnect_at = if self.enabled {
+      state.reconnect_at.take()
+    } else {
+      None
+    };
+    *state = SyncState::empty();
+    state.reconnect_at = reconnect_at;
     self.needs_drain = false;
     Ok(())
   }
@@ -225,14 +259,9 @@ impl Runtime {
     self.network_id = ctx.network_id.clone();
     self.storage_dir = ctx.storage_dir.clone();
     let edge = ctx.edge.clone();
-    let events = Arc::new(NetworkEvents::new(
-      self.network_id.clone(),
-      self.wakeup.clone(),
-    ));
-    self.events = Some(events.clone());
-    edge
-      .subscribe_wg_network_events(move |event| events.observe(&event.network_id, event.action))
-      .await?;
+    let source=yat_network::edge::event_adapter::attach(&edge,controller.events.clone()).await?;
+    let events=Arc::new(NetworkEvents::new(controller.events.clone(),source.edge_id,self.network_id.clone(),self.wakeup.clone()));
+    self.events=Some(events);
     let client_id = ctx.client_id.clone();
     let self_address = ctx.self_address.clone();
     let mut snapshot = ctx.snapshot.clone();
@@ -246,6 +275,7 @@ impl Runtime {
     self.gather = Some(
       crate::gather::subscribe_p2p_events(
         edge.clone(),
+        controller.events.clone(),
         client_id,
         self.storage_dir.clone(),
         self.network_id.clone(),
@@ -256,6 +286,7 @@ impl Runtime {
     {
       let mut state = self.shared.sync.lock().await;
       state.connected = true;
+      state.reconnect_at = None;
       state.network_id = status.network_id;
       state.member_id = status.member_id;
       state.self_address = status.self_address;
@@ -268,9 +299,21 @@ impl Runtime {
       .reconcile_path_control_snapshot(edge, &self.network_id)
       .await
     {
-      Ok(Some(fresh)) => snapshot = fresh,
+      Ok(Some(fresh)) => {
+        let path_controlled = controller.is_path_controlled(&self.network_id).await;
+        tracing::info!(
+          network = %self.network_id,
+          path_controlled,
+          authority_epoch = %fresh.path_authority_epoch,
+          "WG responder initial bootstrap completed"
+        );
+        snapshot = fresh;
+      }
       Ok(None) => (),
       Err(error) => {
+        if control_connection_failed(&error) {
+          return Err(error);
+        }
         tracing::warn!("WG responder assembly deferred: {error:#}");
         self.path_retry_after = Instant::now() + Duration::from_secs(5);
       }
@@ -304,17 +347,27 @@ impl Runtime {
   }
 
   async fn schedule_retry(&mut self) {
-    self.failures += 1;
-    let delay = if self.failures >= 10 {
-      30 * 60
-    } else {
-      (1u64 << self.failures.min(5)).min(30)
-    };
+    self.failures = self.failures.saturating_add(1);
+    // Keep recovering after a long outage. The old 30-minute cooldown after
+    // ten failures could leave a restarted Edge apparently disconnected.
+    let delay = (1u64 << self.failures.min(5)).min(30);
     self.next_attempt = Instant::now() + Duration::from_secs(delay);
     let next = chrono::Local::now() + chrono::Duration::seconds(delay as i64);
     let mut state = self.shared.sync.lock().await;
     state.connected = false;
     state.reconnect_at = Some(next.to_rfc3339());
+    drop(state);
+    tracing::warn!(
+      attempt = self.failures,
+      retry_in_secs = delay,
+      "Edge connection retry scheduled"
+    );
+    self
+      .log(
+        "WARN",
+        format!("Edge reconnect attempt failed; retrying in {delay}s"),
+      )
+      .await;
   }
 
   async fn update_snapshot(&mut self, snapshot: &WGNetworkRuntimeSnapshotData) {
@@ -343,10 +396,12 @@ impl Runtime {
         endpoint: String::new(),
         presence_status: m.presence_status,
         last_handshake_at: None,
+        link_health:None,
       })
       .collect::<Vec<_>>();
     let stats = self.read_runtime_stats().await;
-    peer_paths::update(&mut peers, stats.as_ref(), &self.relay_public_keys);
+    let health=if let Some(controller)=&self.controller {controller.peer_link_health(&self.network_id).await}else{vec![]};
+    peer_paths::update_with_health(&mut peers, stats.as_ref(), &self.relay_public_keys,&health);
     let mut state = self.shared.sync.lock().await;
     state.network_name = snapshot.network.name.clone();
     state.subnet = snapshot.network.subnet.clone();
@@ -400,8 +455,9 @@ impl Runtime {
 
   async fn refresh_peer_paths(&mut self) {
     let stats = self.read_runtime_stats().await;
+    let health=if let Some(controller)=&self.controller {controller.peer_link_health(&self.network_id).await}else{vec![]};
     let mut state = self.shared.sync.lock().await;
-    peer_paths::update(&mut state.peers, stats.as_ref(), &self.relay_public_keys);
+    peer_paths::update_with_health(&mut state.peers, stats.as_ref(), &self.relay_public_keys,&health);
   }
 
   async fn refresh(&mut self, stopping: &AtomicBool) -> Result<()> {
@@ -426,7 +482,7 @@ impl Runtime {
       .and_then(WgManager::edge_client)
       .context("No active connection")?;
     if !edge.is_connected() {
-      return self.start(stopping).await;
+      return Err(TransportError::NotConnected.into());
     }
     let controller = self.controller.as_ref().context("No runtime controller")?;
     let path_controlled = controller.is_path_controlled(&self.network_id).await;
@@ -436,6 +492,8 @@ impl Runtime {
         events.defer_refresh();
       }
     }
+    if event==PendingEvent::None && edge.supports_reliable_runtime_push()
+      && controller.tick_path_control(&self.network_id).await? {return Ok(());}
     // Events advance barriers immediately; the timer only repairs missed
     // notifications/attachments. A failed query imposes the same retry bound
     // even when unrelated pair events continue arriving.
@@ -450,6 +508,9 @@ impl Runtime {
       {
         Ok(snapshot) => refreshed = snapshot,
         Err(error) => {
+          if control_connection_failed(&error) {
+            return Err(error);
+          }
           tracing::warn!("WG responder refresh deferred: {error:#}");
           self.path_retry_after = Instant::now() + Duration::from_secs(5);
           if let Some(events) = &self.events {
@@ -458,6 +519,25 @@ impl Runtime {
         }
       }
       Self::check_running(stopping)?;
+    }
+    if let Some(snapshot) = refreshed.as_ref() {
+      if controller.is_path_controlled(&self.network_id).await {
+        // The authenticated path refresh already ingested topology after
+        // advancing READY/COMMIT. Do not repeat stats/sync work before the next
+        // queued barrier; only project the current local path for the Web UI.
+        self.last_sync = Instant::now();
+        self.update_snapshot(snapshot).await;
+        return Ok(());
+      }
+      // A 5s runtime/barrier read is not a reason to run the legacy topology
+      // sync pipeline on every tick. Keep the UI fresh, but reconcile ordinary
+      // WG state at the existing 30s fallback cadence unless an event drove
+      // this refresh. Linux disables the legacy timer-based full re-apply; real
+      // changes are still applied by the snapshot reconciler.
+      if !ordinary_snapshot_reconcile_due(event, self.last_sync.elapsed()) {
+        self.update_snapshot(snapshot).await;
+        return Ok(());
+      }
     }
     if refreshed.is_none() && self.last_sync.elapsed() < Duration::from_secs(30) {
       return Ok(());
@@ -468,13 +548,8 @@ impl Runtime {
     let snapshot = match refreshed {
       Some(snapshot) => snapshot,
       None => {
-        let response = edge.request_wg_get_network(&self.network_id).await?;
-        anyhow::ensure!(
-          response.success,
-          "Snapshot rejected: {}",
-          response.error_message
-        );
-        response.snapshot.context("Missing network snapshot")?
+        let (edge_id,session_id)=edge.authenticated_event_source().await?;
+        controller.events.ensure_current(&yat_network::events::EventSource {edge_id,session_id},&edge,&self.network_id,true).await?
       }
     };
     Self::check_running(stopping)?;
@@ -550,6 +625,10 @@ impl Driver for Runtime {
           }
           self.start(stopping).await
         }
+        // Explicit recovery must rebuild authentication and the responder even
+        // if the transport is connected. Normal Start remains idempotent.
+        // start() drains the original owner and preserves saved pair modes.
+        Command::Reconnect {} => self.start(stopping).await,
         Command::Leave {} => {
           self.enabled = false;
           let network = if !self.network_id.is_empty() {
@@ -573,6 +652,15 @@ impl Driver for Runtime {
           } else {
             self.stop_local(true).await
           }
+        }
+        Command::Pair { edge, token } => {
+          self.enabled = false;
+          self.stop_local(false).await?;
+          Self::check_running(stopping)?;
+          crate::cli::pair::pair_owned(&edge, &token).await?;
+          *self.shared.config.lock().await = Some(Arc::new(config::load_config()?));
+          // Pairing does not join a WireGuard network or auto-start it.
+          Ok(())
         }
         Command::Import { content } => {
           crate::cli::import::validate_content(&content)?;
@@ -623,6 +711,21 @@ impl Driver for Runtime {
         }
       } else {
         let result = self.refresh(stopping).await;
+        if let Err(error) = &result {
+          if !stopping.load(Ordering::Acquire) && control_connection_failed(error) {
+            tracing::warn!(network = %self.network_id, error = %error, "Edge control connection lost; reconnecting");
+            self
+              .log(
+                "WARN",
+                format!("Edge control connection lost; reconnecting: {error:#}"),
+              )
+              .await;
+            // Reuse the original owner: drain the old session/controller,
+            // authenticate, rejoin, and install fresh event subscriptions.
+            // start() schedules exactly one retry if this attempt fails.
+            return self.start(stopping).await;
+          }
+        }
         // Native display reads share this supervisor and remain available when
         // an Edge query fails. They never send control requests or change paths.
         if !stopping.load(Ordering::Acquire)
@@ -649,10 +752,111 @@ impl Driver for Runtime {
 mod tests {
   use super::*;
 
+  fn runtime() -> Runtime {
+    Runtime::new(Some(Shared {
+      sync: Arc::new(Mutex::new(SyncState::empty())),
+      logs: Arc::new(Mutex::new(LogBuffer::new())),
+      config: Arc::new(Mutex::new(None)),
+      cert_manager: Arc::new(CertManager::new(std::path::Path::new(
+        "/unused/reconnect-test",
+      ))),
+    }))
+  }
+
+  #[tokio::test]
+  async fn prolonged_edge_outage_keeps_retrying_with_a_thirty_second_cap() {
+    let mut runtime = runtime();
+    runtime.shared.sync.lock().await.connected = true;
+    for attempt in 1..=25 {
+      let before = Instant::now();
+      runtime.schedule_retry().await;
+      let delay = runtime.next_attempt.duration_since(before);
+      assert!(
+        delay <= Duration::from_secs(31),
+        "attempt {attempt}: {delay:?}"
+      );
+      assert!(delay >= Duration::from_secs(2));
+      assert_eq!(runtime.failures, attempt);
+      let state = runtime.shared.sync.lock().await;
+      assert!(!state.connected);
+      let deadline =
+        chrono::DateTime::parse_from_rfc3339(state.reconnect_at.as_ref().unwrap()).unwrap();
+      let remaining = deadline.signed_duration_since(chrono::Local::now());
+      assert!(remaining.num_seconds() <= 30);
+      assert!(remaining.num_seconds() >= 0);
+    }
+    runtime.failures = u32::MAX;
+    runtime.schedule_retry().await;
+    assert_eq!(runtime.failures, u32::MAX);
+    assert!(runtime.next_attempt.duration_since(Instant::now()) <= Duration::from_secs(30));
+  }
+
+  #[tokio::test]
+  async fn queued_wakeups_do_not_bypass_connection_retry_deadline() {
+    let mut runtime = runtime();
+    runtime.enabled = true;
+    runtime.needs_drain = false;
+    runtime.schedule_retry().await;
+    // Keep this gate test away from real config/native startup even on a
+    // heavily paused test runner. Actual retry intervals are covered above.
+    runtime.next_attempt = Instant::now() + Duration::from_secs(3600);
+    let deadline = runtime.next_attempt;
+    let stopping = AtomicBool::new(false);
+    for _ in 0..100 {
+      runtime.tick(&stopping).await.unwrap();
+    }
+    assert!(runtime.manager.is_none());
+    assert_eq!(runtime.failures, 1);
+    assert_eq!(runtime.next_attempt, deadline);
+  }
+
+  #[test]
+  fn transport_loss_reconnects_but_authorization_and_native_errors_do_not() {
+    for error in [
+      TransportError::NotConnected,
+      TransportError::Timeout,
+      TransportError::Connection("Response channel closed".into()),
+      TransportError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+      TransportError::Tls("unexpected EOF".into()),
+    ] {
+      let error = anyhow::Error::new(error).context("WG responder refresh");
+      assert!(control_connection_failed(&error), "{error:#}");
+    }
+    for error in [
+      anyhow::Error::new(TransportError::Protocol(
+        "WG path coordination access revoked".into(),
+      )),
+      anyhow::Error::new(TransportError::AuthFailed("session replaced".into())),
+      anyhow::Error::new(TransportError::Certificate("certificate expired".into())),
+      anyhow::anyhow!("Snapshot rejected: network not found"),
+      anyhow::anyhow!("WG authority unavailable; legacy writer remains fenced"),
+      anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+        .context("native WG apply failed"),
+    ] {
+      assert!(!control_connection_failed(&error), "{error:#}");
+    }
+  }
+
   #[test]
   fn every_linux_controller_starts_with_responder_permissions() {
     let controller = new_controller("/unused/linux-responder".into());
     assert_eq!(controller.path_role(), PathRole::Responder);
     assert!(!controller.is_shutting_down());
+  }
+
+  #[test]
+  fn periodic_runtime_reads_only_reconcile_topology_on_event_or_fallback() {
+    assert!(!ordinary_snapshot_reconcile_due(
+      PendingEvent::None,
+      Duration::from_secs(5)
+    ));
+    assert!(ordinary_snapshot_reconcile_due(
+      PendingEvent::Refresh,
+      Duration::from_secs(5)
+    ));
+    assert!(ordinary_snapshot_reconcile_due(
+      PendingEvent::None,
+      Duration::from_secs(30)
+    ));
   }
 }

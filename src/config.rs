@@ -1,4 +1,4 @@
-//! Configuration data types and loading for yat-cli.
+//! Configuration data types and loading for the standalone yat-client.
 //!
 //! Pure data layer: `AppConfig`, config file I/O, and the `config_dir()`
 //! path helper. Business-level path resolution (certs, WG storage) lives
@@ -6,9 +6,9 @@
 //!
 //! ## Share package format (v1)
 //!
-//! The desktop UI exports two modes:
-//! - **Full cert mode**: `edge` + `network(networkId)` + `certificates(caCert, clientCert, clientKey)`
-//! - **Token mode**: `edge` + `network(networkId, inviteToken)` + `certificates(caCert)`
+//! The desktop UI exports `edge` + `network(networkId, inviteToken)` +
+//! `certificates(caCert)`. The recipient generates its own key and obtains a
+//! network-scoped Device certificate. Sender certificates and keys are not shared.
 //!
 //! There is no `identity` or `auth` section — the CLI generates its own
 //! device identity locally and uses invite tokens for cert bootstrap.
@@ -45,8 +45,8 @@ pub struct IdentityConfig {
 
 /// Network configuration imported from a share package.
 ///
-/// `invite_token` is present in token mode (client cert will be bootstrapped
-/// on first serve). It is `None` in full cert mode (certs already imported).
+/// `invite_token` bootstraps a Device certificate on first serve. It may be
+/// cleared after use; network import always requires a valid invite token.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetworkConfig {
   pub network_id: String,
@@ -68,47 +68,27 @@ impl AppConfig {
 
 // ─── Device identity (convenience view over config identity fields) ──────────
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct DeviceIdentity {
   pub device_id: String,
-  pub hostname: Option<String>,
 }
 
-// ─── Load / Save ─────────────────────────────────────────────────────────────
+// ─── Load ────────────────────────────────────────────────────────────────────
 
 pub fn load_config() -> Result<AppConfig> {
   let path = config_file_path();
   let content = std::fs::read_to_string(&path)
-    .with_context(|| format!("No config found at {}. Run `yat-cli import <share.json>` first.", path.display()))?;
+    .with_context(|| format!("No config found at {}. Run `yat-client pair` or `yat-client import <share.json>` first.", path.display()))?;
   let config: AppConfig =
     serde_json::from_str(&content).with_context(|| "Failed to parse config.json")?;
   Ok(config)
-}
-
-pub fn load_device_identity() -> Result<DeviceIdentity> {
-  let config = load_config()?;
-  Ok(DeviceIdentity {
-    device_id: config.identity.device_id,
-    hostname: config.identity.hostname,
-  })
-}
-
-#[allow(dead_code)]
-pub fn save_device_identity(identity: &DeviceIdentity) -> Result<()> {
-  // Update the identity fields in config.json
-  let mut config = load_config()?;
-  config.identity.device_id = identity.device_id.clone();
-  config.identity.hostname = identity.hostname.clone();
-  let path = config_file_path();
-  std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
-  Ok(())
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
 pub fn config_dir() -> PathBuf {
   let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-  PathBuf::from(home).join(".config/yat-cli")
+  PathBuf::from(home).join(".config/yat")
 }
 
 pub fn config_file_path() -> PathBuf {

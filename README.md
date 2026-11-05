@@ -1,50 +1,308 @@
-# YAT Linux Server 客户端
+> ###  English | [中文](README_ZH.md) | [日本語](README_JA.md)
 
-本目录 `yat-fe-linux` 提供面向 Linux Server 的独立 Rust CLI/服务，不是 `yat-fe` 的 Electron 桌面 Linux 构建。桌面版使用 `yat-fe` → Network NAPI/Agent；本服务使用自己的 `client_owner`、私有 socket 和 Docker 前台入口，两端仅共享底层 Network/Transport/WireGuard 库。
+# yat-fe-linux
+Yat client for linux
 
-要求 **Linux 内核 ≥ 5.6**。WireGuard 从 5.6 起进入主线内核；部分发行版有 5.4 等旧版回移，但本项目统一以 5.6 为最低支持基线。两端共用的 native apply 在写入前强制检查，server 的 `start/serve` 还会在连接 Edge 前检查。`leave` 清理和只读诊断不受新建连接门禁限制。Docker 使用宿主机内核，容器镜像中安装 `wireguard-tools` 不能替代宿主机 WireGuard 模块或内建支持；还需要 `iproute2`、`wireguard-tools` 及目标网络命名空间的 `CAP_NET_ADMIN` 权限。
 
-内核依据：[WireGuard 官方安装说明](https://www.wireguard.com/install/)（5.6+ 内核集成）。
+YAT Linux Client (`yat-client`) is the native Linux client for the YAT platform. It provides WireGuard networking capabilities and a built-in Web Dashboard for management. Docker images support amd64, arm64, and armv7; standalone binaries are listed for amd64 and arm64.
 
-推荐使用 Docker 前台运行。镜像默认直接执行 `yat-client serve`，客户端作为 PID 1 接收 Docker 的 `SIGTERM`，同时启动 Web 管理界面。默认在容器内监听 `0.0.0.0:9909`，可用 `YAT_LISTEN` 或 `serve --listen <地址>` 修改。Web 管理 API 当前没有鉴权，能够读取配置/状态、导入分享包、重连和修改地址。下面仅将管理端口发布到宿主机回环地址；远程管理可通过 SSH 端口转发访问。私有 Unix socket 的权限保护不适用于 HTTP 接口。
+---
 
-以下命令中的 `IMAGE` 表示包含当前代码构建结果的镜像。配置目录应使用同一个持久化卷；目录包含设备身份、证书、WireGuard 状态和本地命令通道。
+## Quick Start
+
+Get a Linux machine connected to your YAT WireGuard network in three steps:
 
 ```bash
-# 首次导入只写入配置，不启动连接；share.json 只读挂载。
-docker run --rm \
-  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
-  --mount type=bind,src="$PWD/share.json",dst=/run/yat-share.json,readonly \
-  IMAGE import /run/yat-share.json
-
-# 前台运行，使用容器自身的网络命名空间。
-docker run --name yat-client \
+# 1. Start the client (Docker)
+docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
-  --stop-timeout 60 \
-  --publish 127.0.0.1:9909:9909 \
-  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
-  IMAGE
+  --net host \
+  ghcr.io/tunnel6/yat-client-linux:latest yat-client serve
+
+# 2. Open the Dashboard in your browser
+#    http://<your-linux-ip>:9909
+
+# 3. Upload share.json in the Settings tab — the client connects automatically
+```
+![Dashboard](assets/overview.png)
+
+
+> **Tip**: Export `share.json` from the desktop app (macOS/Windows) and import it via the Dashboard or CLI.
+
+## Export Network Configuration
+
+In the desktop app, open **Networks** → **Detail** → **Share to CLI** to export `share.json`, then import the file into the Linux client.
+
+![Export network configuration from the desktop app](assets/export-network-en.png)
+
+---
+
+## Requirements
+
+| Item | Requirement |
+|------|-------------|
+| **OS** | Linux (x86_64 / aarch64 / armv7) |
+| **Kernel** | Host kernel must support WireGuard; load the `wireguard` module on the host if it is not built in or loaded automatically |
+| **Docker** | Docker 20.10+ (when running via Docker) |
+| **Privileges** | `root` or `CAP_NET_ADMIN` (required for WireGuard interface creation) |
+| **Network** | Reachable YAT Edge server (port determined by Edge config) |
+| **Memory** | Minimum 64 MB available |
+
+### Additional Docker Permissions
+
+The `wireguard` kernel module belongs to the host, not the container image. If it is not built into or automatically loaded by the host kernel, load it on the host before starting the container:
+
+```bash
+sudo modprobe wireguard
 ```
 
-需要更新配置时，将分享包复制到运行中的容器，然后执行 `docker exec yat-client yat-client import <容器内文件路径>`；操作完成后删除该分享包。`docker exec yat-client yat-client leave` 显式退出网络。普通容器停止保留网络成员资格，随后可以重新连接。
+```bash
+# Required Docker permissions for the TUN interface and route configuration
+--cap-add NET_ADMIN \
+--device /dev/net/tun
+```
 
-同一配置目录只允许一个客户端写入 native 配置。运行中的 `start/leave/import` 命令通过该目录下的 `yat-fe-linux.sock` 发送给现有所有者；`yat-fe-linux.lock` 是永久锁文件，运行中不得删除。锁被占用而 socket 不可用时，命令返回错误，不会自行创建另一个配置写入者。配置目录权限为 `0700`，socket 和锁文件为 `0600`。不要把配置卷暴露给无关容器。
+---
 
-`docker stop --time 60 yat-client` 先发送 `SIGTERM`。信号只通知当前所有者：正在执行的操作完成后，关闭命令入口、停止心跳并关闭 Edge 控制连接，再通过原 controller 排空和清理 native 资源，最后回收任务并退出。清理失败时保留所有者和锁并重试。60 秒是示例宽限期，不是清理耗时保证；宽限期结束后 Docker 可以强制终止进程。
+## Running the Client
 
-正常退出和可处理的错误走同一关闭流程，不按 0–255 退出状态码区分是否清理。进程崩溃、`SIGKILL`、Docker 强杀或宿主机故障无法保证执行退出回调，由 Edge 的断连或超时检测判定离线。普通关闭使用控制连接断开，不发送改变成员资格的 Leave 请求。
+### Option 1: Docker (Recommended)
 
-不需要 Web 管理界面时，可用 `docker run ... IMAGE start` 覆盖默认命令，并省略管理端口发布。使用 host 网络时，默认的 `0.0.0.0:9909` 会直接监听宿主机所有地址；需要本机访问时显式设置 `YAT_LISTEN=127.0.0.1:9909`。
+#### Pull Image
 
-`yat-client status` 读取磁盘状态、applied state 及可用的 native stats，目前不通过 socket 查询运行中所有者的 Edge 连接；其 `Connected: no (daemon mode or stale)` 不能用于判定现有服务离线。Web `/api/status` 使用运行中所有者的状态；其中 `connected` 表示连接/本地初次应用状态，不等于对端业务路径已经双端验证。
+```bash
+# Pull from GitHub Container Registry (supports amd64 / arm64 / arm/v7)
+docker pull ghcr.io/tunnel6/yat-client-linux:latest
+```
 
-当前实现接入 optional 网络路径协商的 **P1 纯响应端**：平台支持时声明 `wg.path-coordination.v1`，初次 native apply 后立即装配共享执行器；网络推送唤醒同一个 supervisor，获取当前认证 snapshot 后响应 READY、执行共同 COMMIT 并回报 APPLIED/REJECTED。事件突发合并，保留 5 秒恢复兜底；Linux 不发送 CHANGE_MODE、SWITCH_PATH 或 SYNC_MODE，也没有手动 override CLI/HTTP/Web 入口。桌面端的用户选择和 Auto 提议均可由 Linux 响应。
+The generic `1.0.0` and `latest` tags include amd64, arm64, and arm/v7 images. `latest` currently points to `1.0.0`. Docker automatically selects the image matching the host architecture, so these generic tags are recommended for Raspberry Pi devices.
 
-P1 的“只响应”包含实际路径执行：收到共同 COMMIT 后迁移对端 host AllowedIPs 归属、设置 endpoint，调用 Linux 原生 WireGuard 应用并回读验证，通过后才回报 APPLIED。P2 仅增加只读状态展示。
+| Tag | Architecture | Use case |
+|-----|--------------|----------|
+| `1.0.0`, `latest` | amd64, arm64, arm/v7 | Recommended; Docker selects the matching architecture |
+| `amd64-1.0.0` | amd64 (x86_64) | x86_64 hosts |
+| `arm64-1.0.0` | arm64 (aarch64) | 64-bit ARM systems |
+| `arm-1.0.0` | arm/v7 (armv7) | 32-bit ARMv7 systems |
 
-Web 已接入最小真实路径展示：Local Path 为本地实际配置的 Direct/Relay/Unknown，Path Endpoint 来自实际承载目标虚拟 IP 的 WG peer，Path Handshake 也取同一 peer（Relay 时为 relay）的握手。按原生 AllowedIPs 最长前缀匹配，支持 IPv4/IPv6 和固定 Relay 子网；读取失败、缺路由或 owner 不明确时清空旧值，显示 Unknown / `—`，不再用 observed/LAN 候选地址代替。原 supervisor 每 5 秒兜底读取本地 runtime，无新增 Edge 请求。该展示不表示双方共同确认或业务可达，不包含选择原因和协商进度。
+For Raspberry Pi devices, early Raspberry Pi 2 Model B (revision 1.1) uses ARMv7, so use `arm-1.0.0` when selecting an architecture-specific tag. Later Pi 2 revisions and Raspberry Pi 3 use Armv8-capable processors, but the image architecture depends on the installed operating system: Raspberry Pi 3 does not always require `arm-1.0.0`. Run `uname -m` on the host to check: `armv7l` maps to `arm-1.0.0`, and `aarch64` maps to `arm64-1.0.0`. With `1.0.0` or `latest`, no manual selection is needed.
 
-普通停止和重连保留已保存的 pair 策略；明确 Leave/网络删除才清理。Edge 丢失状态时，由主动端恢复策略；如果只有 Linux 保有旧策略，新计划又缺少共同策略，Linux 会拒绝并保留设置，需要主动端恢复或明确重新选择 Auto/Direct/Relay。COMMIT 后失败恢复原命令，不自动改选路径。原生初次创建后，optional 网络不能通过旧周期配置流程绕过协商改路由。
+References: [Raspberry Pi BCM2836 documentation](https://github.com/raspberrypi/documentation/blob/master/documentation/asciidoc/computers/processors/bcm2836.adoc) and [BCM2837 documentation](https://github.com/raspberrypi/documentation/blob/master/documentation/asciidoc/computers/processors/bcm2837.adoc).
 
-分阶段代码边界、回归结果和真实 Linux 平台验收矩阵见 [Linux 响应端 Code Plan](../docs/wireguard/WIREGUARD_LINUX_RESPONDER_CODE_PLAN_2026-10-24.md)。P2 的共同策略、pair 进度与失败原因，以及 P3 主动发起尚未实施；编译和 fixture 通过不代表已完成真实 Linux 与桌面端的双端验收。Edge 仍需启用路径协商配置，对端当前会话也须支持该能力。
+#### Start Container
+
+```bash
+# Host network mode is required for WireGuard tunnel routing (default Dashboard port: 9909)
+docker run -d --name yat-client \
+  --cap-add NET_ADMIN \
+  --device /dev/net/tun \
+  --net host \
+  ghcr.io/tunnel6/yat-client-linux:latest yat-client serve
+```
+
+#### Custom Port
+
+```bash
+# Change the Web UI listen port
+docker run -d --name yat-client \
+  --cap-add NET_ADMIN \
+  --device /dev/net/tun \
+  --net host \
+  ghcr.io/tunnel6/yat-client-linux:latest \
+  yat-client serve --listen=0.0.0.0:8080
+
+# Or set the listen address with an environment variable
+docker run -d --name yat-client \
+  --cap-add NET_ADMIN \
+  --device /dev/net/tun \
+  --net host \
+  -e YAT_LISTEN=0.0.0.0:8080 \
+  ghcr.io/tunnel6/yat-client-linux:latest yat-client serve
+```
+
+#### Persist Configuration
+
+```bash
+# Mount config directory to survive container restarts
+docker run -d --name yat-client \
+  --cap-add NET_ADMIN \
+  --device /dev/net/tun \
+  --net host \
+  -v ~/.config/yat-cli:/root/.config/yat-cli \
+  ghcr.io/tunnel6/yat-client-linux:latest yat-client serve
+```
+
+#### View Logs
+
+```bash
+docker logs -f yat-client
+```
+
+---
+
+### Option 2: CLI Binary
+
+#### Download Binary
+
+```bash
+# Download the binary for your architecture (x86_64 example)
+chmod +x yat-client
+```
+
+#### CLI Command Reference
+
+| Command | Description |
+|---------|-------------|
+| `yat-client import <share.json>` | Import a network configuration package |
+| `yat-client serve [--listen ADDR]` | Start daemon with Web Dashboard |
+| `yat-client start` | Foreground connection mode (no Web UI) |
+| `yat-client status` | Show current network status |
+| `yat-client leave` | Leave network and teardown WireGuard interface |
+| `yat-client cert-info` | Display certificate information |
+
+#### Typical Workflow
+
+```bash
+# 1. Import network config (share.json exported from desktop app)
+sudo yat-client import share.json
+
+# 2. Start the daemon (default listen: 0.0.0.0:9909)
+sudo yat-client serve
+
+# Or specify a custom listen address
+sudo yat-client serve --listen 0.0.0.0:8080
+
+# 3. Open the Dashboard in your browser
+#    http://<your-linux-ip>:9909
+```
+
+> **Note**: The `import` and `serve` commands require root privileges to create the WireGuard network interface.
+
+#### Foreground Mode (No Web UI)
+
+```bash
+# Suitable for scripting or temporary use
+sudo yat-client start
+# Press Ctrl+C to disconnect
+```
+
+#### Check Status
+
+```bash
+sudo yat-client status
+```
+
+Example output:
+
+```
+Network:    net-xxxxxxxxxxxx
+Member:     member-xxxxxxxx
+Interface:  yat0 (kernel)
+Address:    10.0.0.5
+Peers:      3
+Connected:  yes
+
+── WireGuard Engine ──
+Backend:    wireguard
+Interface:  yat0 (kernel)
+Address:    10.0.0.5
+Public key: abcdef1234567890...
+Peers:      3
+
+── Live Stats ──
+Backend:    wireguard (yat0)
+Peers:      3
+  [server-a] ep=1.2.3.4:51820 rx=12.3MB tx=5.6MB
+  [server-b] ep=5.6.7.8:51820 rx=8.1MB tx=3.2MB
+  [server-c] ep=relay.yat.io:443 rx=0.5MB tx=0.3MB
+```
+
+---
+
+## Web Dashboard Guide
+
+After starting the `serve` command, a feature-rich Web Dashboard is available in your browser.
+
+### Dashboard Tab
+
+- **Network Info** — View Network ID, Member ID, assigned IP address, interface name, and other core details
+- **Network Status** — Real-time connection status, online peer count, last sync timestamp
+- **Peers** — Complete peer list with hostname, IP address, endpoint, and RX/TX traffic statistics
+- **Certificate** — Certificate details (Subject / Issuer / Validity / Fingerprint) with one-click renewal
+- **Latest Logs** — Last 50 runtime log entries, color-coded by severity (INFO / WARN / ERROR)
+
+### Settings Tab
+
+- **Edge Connection** — View Edge server host, port, and Edge ID
+- **Identity** — View User ID, Device ID, and hostname
+- **Import** — Open the Linux agent Dashboard (for example, `http://<linux-agent-ip>:9909`), then use the import control at the bottom of the Settings page to upload `share.json`; the service restarts automatically after import
+
+![Import control at the bottom of the Settings page](assets/import-network.png)
+- **Reconnect** — Manually trigger Edge reconnection (useful when disconnected)
+- **Update Address** — Dynamically change this device's IP address within the network
+
+### Dashboard Highlights
+
+- Dark theme with YAT green accent (#22c55e)
+- Auto-refresh status data every 5 seconds
+- Zero-config startup — launch the Dashboard first, then import config via the Web UI
+- Automatic certificate monitoring — checks hourly, auto-renews when nearing expiry (requires OAuth credentials)
+- Auto-reconnect on disconnect — exponential backoff strategy, up to 10 retries before entering a 30-minute cooldown
+
+---
+
+## Configuration
+
+Configuration files are stored in `~/.config/yat-cli/`:
+
+```
+~/.config/yat-cli/
+├── config.json          # Main config (Edge connection + identity)
+├── device-id            # Local device ID (stable across re-imports)
+├── device-identity.json # Device identity (associated with WG key pair)
+└── certs/
+    ├── ca.crt           # CA certificate
+    ├── captain-ca.crt   # Captain CA certificate
+    ├── client.crt       # Client certificate
+    └── client.key       # Client private key
+```
+
+---
+
+## Release Notes
+
+### v1.0.0
+
+| libc | Architecture | Base image | Platform |
+|------|--------------|------------|----------|
+| musl | amd64 | `alpine:3.20-amd64` | `linux/amd64` |
+| musl | arm64 | `alpine:3.20-arm64` | `linux/arm64` |
+| GNU | amd64 | `debian:bookworm-slim-amd64` | `linux/amd64` |
+| GNU | arm64 | `debian:bookworm-slim-arm64` | `linux/arm64` |
+| GNU | armv7 | `debian:bookworm-slim-armv7` | `linux/arm/v7` |
+
+## Architecture Support
+
+| Architecture | Docker Image | Binary |
+|-------------|-------------|--------|
+| linux/amd64 (x86_64) | ✅ | ✅ |
+| linux/arm64 (aarch64) | ✅ | ✅ |
+| linux/arm/v7 (armv7) | ✅ | Not listed |
+
+Image variants use Alpine 3.20 (musl libc) or Debian Bookworm slim (GNU libc).
+
+---
+
+## FAQ
+
+**Q: Why does it need root privileges?**  
+A: WireGuard requires creating a TUN network interface and configuring routes, which need kernel-level network management permissions.
+
+**Q: Configuration lost after container restart?**  
+A: Mount a persistent volume with `-v ~/.config/yat-cli:/root/.config/yat-cli`.
+
+**Q: What if the certificate expires?**  
+A: If imported via `share.json` (with OAuth credentials), the system auto-renews. Otherwise, re-export from the desktop app and re-import.
+
+**Q: How to run in the background?**  
+A: Use Docker (`docker run -d`), or `nohup sudo yat-client serve &`. You can also create a systemd service unit.

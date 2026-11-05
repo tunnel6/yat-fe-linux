@@ -118,7 +118,7 @@ async fn api_cert(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 /// POST /api/cert/renew — trigger certificate renewal.
 ///
-/// Since CLI doesn't have OAuth tokens, this checks cert status and
+/// This checks the paired device certificate status and
 /// advises the user to re-import from the desktop app if renewal is needed.
 async fn api_cert_renew(State(state): State<AppState>) -> Json<serde_json::Value> {
   match state.cert_manager.cert_info() {
@@ -218,17 +218,10 @@ async fn command_reply(state: &AppState, command: Command) -> Json<serde_json::V
 
 /// POST /api/reconnect — manually trigger Edge reconnection.
 ///
-/// Wakes up the reconnect loop immediately (interrupts any back-off wait).
+/// Uses the original supervisor to drain and rebuild the authenticated session,
+/// including when transport is connected but coordination is unavailable.
 async fn api_reconnect(State(state): State<AppState>) -> Json<serde_json::Value> {
-  let s = state.sync.lock().await;
-  if s.connected {
-    return Json(serde_json::json!({
-      "success": false,
-      "message": "Already connected.",
-    }));
-  }
-  drop(s);
-  command_reply(&state, Command::Start {}).await
+  command_reply(&state, Command::Reconnect {}).await
 }
 
 /// POST /api/address — update this device's IP address in the network.
@@ -253,4 +246,70 @@ async fn api_update_address(
   };
 
   command_reply(&state, Command::UpdateAddress { new_ip }).await
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::client_owner::supervisor::{self, Driver, Work};
+  use std::sync::atomic::AtomicBool;
+  use tokio::sync::{mpsc, Semaphore};
+
+  struct ReconnectDriver {
+    commands: mpsc::UnboundedSender<Command>,
+    finish: Arc<Semaphore>,
+    reject: bool,
+  }
+  impl Driver for ReconnectDriver {
+    fn execute<'a>(&'a mut self, command: Command, _: &'a AtomicBool) -> Work<'a> {
+      Box::pin(async move {
+        self.commands.send(command)?;
+        self.finish.acquire().await?.forget();
+        anyhow::ensure!(!self.reject, "Session rebuild rejected");
+        Ok(())
+      })
+    }
+    fn tick<'a>(&'a mut self, _: &'a AtomicBool) -> Work<'a> {
+      Box::pin(async { Ok(()) })
+    }
+    fn stop(&mut self) -> Work<'_> {
+      Box::pin(async { Ok(()) })
+    }
+  }
+
+  #[tokio::test]
+  async fn reconnect_reaches_owner_even_when_connected_and_waits_for_result() {
+    for (connected, reject) in [(true, false), (false, false), (true, true)] {
+      let (commands, mut observed) = mpsc::unbounded_channel();
+      let finish = Arc::new(Semaphore::new(0));
+      let (owner, task) = supervisor::spawn(ReconnectDriver {
+        commands,
+        finish: finish.clone(),
+        reject,
+      });
+      let mut sync = SyncState::empty();
+      sync.connected = connected;
+      let state = AppState {
+        sync: Arc::new(Mutex::new(sync)),
+        logs: Arc::new(Mutex::new(LogBuffer::new())),
+        config: Arc::new(Mutex::new(None)),
+        cert_manager: Arc::new(CertManager::new(std::path::Path::new("/unused"))),
+        client_owner: owner.clone(),
+      };
+      let request = tokio::spawn(api_reconnect(State(state)));
+      assert!(matches!(observed.recv().await, Some(Command::Reconnect {})));
+      assert!(
+        !request.is_finished(),
+        "HTTP must wait for the owner result"
+      );
+      finish.add_permits(1);
+      let Json(response) = request.await.unwrap();
+      assert_eq!(response["success"], !reject);
+      if reject {
+        assert_eq!(response["error"], "Session rebuild rejected");
+      }
+      owner.shutdown();
+      task.await.unwrap();
+    }
+  }
 }

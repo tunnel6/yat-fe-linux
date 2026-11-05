@@ -36,14 +36,12 @@ pub(crate) fn validate_content(content: &str) -> Result<serde_json::Value> {
   anyhow::ensure!(port > 0 && port <= u16::MAX as u64, "Invalid edge.port");
   required("network", "networkId", "network_id")?;
   required("certificates", "caCert", "caCert")?;
-  let cert = share["certificates"].get("clientCert");
-  let key = share["certificates"].get("clientKey");
-  if cert.is_some() || key.is_some() {
-    required("certificates", "clientCert", "clientCert")?;
-    required("certificates", "clientKey", "clientKey")?;
-  } else {
-    required("network", "inviteToken", "invite_token")?;
-  }
+  anyhow::ensure!(
+    share["certificates"].get("clientCert").is_none()
+      && share["certificates"].get("clientKey").is_none(),
+    "Full certificate sharing is no longer supported; export a network invite package"
+  );
+  required("network", "inviteToken", "invite_token")?;
   // Deserialize the exact normalized configuration before changing disk state.
   let _: crate::config::AppConfig = serde_json::from_value(normalize(&share, "validation-device"))?;
   Ok(share)
@@ -88,19 +86,13 @@ pub(crate) fn import_content(content: &str) -> Result<()> {
   // import succeeds. Never connect using a mixed old/new certificate bundle.
   let marker = directory.join("import.pending");
   write_private(&marker, b"Incomplete import; re-import share package")?;
-  for (filename, field) in [
-    ("ca.crt", "caCert"),
-    ("client.crt", "clientCert"),
-    ("client.key", "clientKey"),
-  ] {
-    if let Some(value) = share["certificates"][field].as_str() {
-      write_private(&certs.join(filename), value.as_bytes())?;
-    } else {
-      match std::fs::remove_file(certs.join(filename)) {
-        Ok(()) => (),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-        Err(e) => return Err(e.into()),
-      }
+  write_private(&certs.join("ca.crt"), share["certificates"]["caCert"].as_str().unwrap().as_bytes())?;
+  // A network invite obtains a fresh Device certificate under this device's key.
+  for filename in ["client.crt", "client.key", "enrollment.pending"] {
+    match std::fs::remove_file(certs.join(filename)) {
+      Ok(()) => (),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+      Err(e) => return Err(e.into()),
     }
   }
   write_private(&directory.join("config.json"), &config)?;
@@ -117,7 +109,7 @@ pub(crate) fn import_content(content: &str) -> Result<()> {
   Ok(())
 }
 
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
   let temporary = path.with_extension("import-tmp");
   let mut file = std::fs::OpenOptions::new()
     .write(true)
@@ -151,5 +143,12 @@ mod tests {
       assert!(validate_content(&invalid.to_string()).is_err());
     }
     assert!(validate_content(&"x".repeat(MAX_IMPORT + 1)).is_err());
+    let mut old_full_export = valid.clone();
+    old_full_export["certificates"]["clientCert"] = serde_json::json!("owner certificate");
+    old_full_export["certificates"]["clientKey"] = serde_json::json!("owner private key");
+    assert!(validate_content(&old_full_export.to_string()).is_err());
+    let mut missing_invite = valid;
+    missing_invite["network"].as_object_mut().unwrap().remove("inviteToken");
+    assert!(validate_content(&missing_invite.to_string()).is_err());
   }
 }

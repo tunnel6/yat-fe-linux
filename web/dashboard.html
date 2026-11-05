@@ -292,11 +292,11 @@
           kv('Peers', statusRes.peer_count) +
           kv('Last Sync', timeAgo(statusRes.last_sync_at));
 
-        // Reconnect button + info (only when disconnected)
+        // A connected transport can still need session/responder recovery.
         const reconnectBtn = $('#reconnect-btn');
         const reconnectInfo = $('#reconnect-info');
+        reconnectBtn.classList.remove('hidden');
         if (!statusRes.connected) {
-          reconnectBtn.classList.remove('hidden');
           if (statusRes.reconnect_at) {
             const remaining = Math.max(0, Math.floor((new Date(statusRes.reconnect_at) - Date.now()) / 1000));
             const mins = Math.floor(remaining / 60);
@@ -307,7 +307,6 @@
             reconnectInfo.classList.add('hidden');
           }
         } else {
-          reconnectBtn.classList.add('hidden');
           reconnectInfo.classList.add('hidden');
         }
 
@@ -318,17 +317,25 @@
           $('#peers-table').innerHTML = '<p class="text-zinc-500 text-sm">No peers</p>';
         } else {
           let html = '<table class="w-full text-xs"><thead><tr class="text-zinc-500 text-left">';
-          html += '<th class="pb-2 pr-3">Hostname</th><th class="pb-2 pr-3">IP</th><th class="pb-2 pr-3 whitespace-nowrap" title="Local WireGuard path; does not indicate end-to-end reachability">Local Path</th><th class="pb-2 pr-3 whitespace-nowrap">Path Endpoint</th><th class="pb-2 pr-3 whitespace-nowrap" title="Handshake with the carrying WireGuard peer, including the relay for Relay paths">Path Handshake</th><th class="pb-2">Public Key</th></tr></thead><tbody>';
+          html += '<th class="pb-2 pr-3">Hostname</th><th class="pb-2 pr-3">IP</th><th class="pb-2 pr-3 whitespace-nowrap" title="Local WireGuard path; does not indicate end-to-end reachability">Local Path</th><th class="pb-2 pr-3 whitespace-nowrap">Path Endpoint</th><th class="pb-2 pr-3 whitespace-nowrap" title="Handshake with the carrying WireGuard peer, including the relay for Relay paths">Path Handshake</th><th class="pb-2 pr-3">Link Health</th><th class="pb-2">Public Key</th></tr></thead><tbody>';
           peers.forEach(p => {
             const path = p.local_path === 'direct' ? 'Direct' : p.local_path === 'relay' ? 'Relay' : 'Unknown';
             const ep = p.endpoint || '—';
             const hs = p.last_handshake_at ? formatHandshake(p.last_handshake_at) : '—';
+            const health = p.link_health;
+            const healthStatus = health?.reachability === 'unresponsive' ? 'unresponsive' : health?.freshness;
+            const healthText = p.presence_status === 2 ? 'Offline' : ({
+              unresponsive: 'No response to probes',
+              fresh: 'Connection healthy',
+              stale: 'Connection needs verification',
+            }[healthStatus] || 'Unconfirmed');
             html += `<tr class="border-t border-zinc-800">`;
             html += `<td class="py-1.5 pr-3 text-zinc-200">${escapeHtml(p.hostname || '—')}</td>`;
             html += `<td class="py-1.5 pr-3 text-zinc-300">${escapeHtml(p.assigned_ip)}</td>`;
             html += `<td class="py-1.5 pr-3 text-zinc-300">${path}</td>`;
             html += `<td class="py-1.5 pr-3 text-zinc-400 whitespace-nowrap">${escapeHtml(ep)}</td>`;
             html += `<td class="py-1.5 pr-3 text-zinc-400">${hs}</td>`;
+            html += `<td class="py-1.5 pr-3 text-zinc-400">${escapeHtml(healthText)}</td>`;
             html += `<td class="py-1.5 text-zinc-500 font-mono">${escapeHtml(p.public_key || '—')}</td>`;
             html += `</tr>`;
           });
@@ -491,11 +498,17 @@
       btn.disabled = true;
       btn.textContent = 'Reconnecting...';
       try {
-        await fetch('/api/reconnect', { method: 'POST' });
+        const response = await fetch('/api/reconnect', { method: 'POST' });
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || result.message || 'Reconnect failed');
+        }
+        await refreshDashboard();
         $('#reconnect-info').classList.remove('hidden');
-        $('#reconnect-info').textContent = 'Reconnect triggered, waiting...';
+        $('#reconnect-info').textContent = 'Reconnected to Edge.';
       } catch (e) {
-        console.error('Reconnect failed:', e);
+        $('#reconnect-info').classList.remove('hidden');
+        $('#reconnect-info').textContent = 'Reconnect failed: ' + e.message;
       }
       btn.disabled = false;
       btn.textContent = 'Reconnect';

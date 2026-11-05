@@ -9,7 +9,7 @@ pub async fn dispatch(command: Command) -> anyhow::Result<()> {
   match OwnerLock::acquire(&crate::config::config_dir())? {
     Some(owner) => match command {
       Command::Start {} => crate::cli::serve::run_owned(owner, None).await,
-      command @ (Command::Leave {} | Command::Import { .. }) => {
+      command @ (Command::Leave {} | Command::Import { .. } | Command::Pair { .. }) => {
         // Short commands use the same supervisor/drain path and hold the OS
         // lock through failure cleanup. Import alone does not start a client.
         let (handle, task) = supervisor::spawn(crate::daemon::runtime::Runtime::new(None));
@@ -23,7 +23,9 @@ pub async fn dispatch(command: Command) -> anyhow::Result<()> {
         anyhow::ensure!(reply.success, "{}", reply.message);
         Ok(())
       }
-      Command::UpdateAddress { .. } => anyhow::bail!("No running client"),
+      Command::Reconnect {} | Command::UpdateAddress { .. } => {
+        anyhow::bail!("No running client")
+      }
     },
     None => {
       // A forwarding CLI owns no native work. Restore normal signal behavior

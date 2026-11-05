@@ -19,6 +19,7 @@ use tracing::{info, warn};
 
 use yat_transport::{EdgeClient, WGP2PEvent};
 
+#[cfg(test)]
 fn scoped_network_id(session_id: &str) -> Option<&str> {
   session_id
     .strip_prefix("lan:")
@@ -186,24 +187,15 @@ impl Subscription {
 
 pub async fn subscribe_p2p_events(
   edge: Arc<EdgeClient>,
+  events: Arc<yat_network::events::NetworkEventManager>,
   client_id: String,
   storage_dir: String,
   network_id: String,
   self_address: String,
 ) -> anyhow::Result<Subscription> {
-  let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
-  let scope = network_id.clone();
-  edge
-    .subscribe_wg_p2p_events(move |event| {
-      if let WGP2PEvent::Gather { session_id } = event {
-        if scoped_network_id(&session_id) == Some(scope.as_str()) {
-          if tx.try_send(session_id).is_err() {
-            warn!("Gather queue full or stopping; event dropped");
-          }
-        }
-      }
-    })
-    .await?;
+  use yat_network::events::{EventFilter,NetworkEventKind};
+  let (edge_id,_)=edge.authenticated_event_source().await?;
+  let mut rx=events.subscribe_with_snapshot(EventFilter {edge_id:Some(edge_id),network_id:Some(network_id.clone()),class:Some(yat_network::events::EventClass::Signalling)});
   let (stop, mut stopping) = tokio::sync::watch::channel(false);
   let task = tokio::spawn(async move {
     loop {
@@ -214,8 +206,8 @@ pub async fn subscribe_p2p_events(
         biased;
         _ = stopping.changed() => break,
         session = rx.recv() => match session {
-          Some(session) => handle_gather(&edge, &session, &client_id, &storage_dir, &network_id, &self_address).await,
-          None => break,
+          Ok(event) => if events.is_current(&event.source) {if let NetworkEventKind::P2p(WGP2PEvent::Gather {session_id})=event.kind { handle_gather(&edge,&session_id,&client_id,&storage_dir,&network_id,&self_address).await; }},
+          Err(_) => {let _=edge.disconnect().await; break;},
         }
       }
     }

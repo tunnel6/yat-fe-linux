@@ -8,6 +8,12 @@ YAT Linux Server 客户端 (`yat-client`，目录 `yat-fe-linux`) 是面向 Linu
 
 ## 版本更新记录
 
+### Edge 重启恢复修正 / 未发布（2026-10-26）
+
+- Edge 断连、控制连接错误及传输超时统一交给原 supervisor 恢复：排空旧实例、重新认证入网、重建网络与路径响应订阅，保留 pair 策略。
+- 自动重试间隔为 2、4、8、16、30 秒，后续封顶 30 秒持续重试；移除失败 10 次后的 30 分钟等待。TCP/TLS 建连期限 10 秒，认证期限 30 秒，native 操作保持原有排空规则。
+- 授权/协调拒绝与 native 错误不会单独触发重新入网。恢复阶段日志和 Web 重试时间保留；本机回归不替代真实 Edge 重启验收，详见 [Code Plan §11](../docs/wireguard/WIREGUARD_LINUX_RESPONDER_CODE_PLAN_2026-10-24.md#11-edge-重启后的自动恢复修正2026-10-26)。
+
 ### 当前源码 / 未发布（2026-10-19）
 
 - Linux Server 的 `start/serve/leave/import` 与 Web 操作统一交给同一 `client_owner`；同一配置目录通过永久锁文件和私有 `yat-fe-linux.sock` 排除第二个 native 配置写入者。桌面 Linux 不使用此套 Server IPC/Docker 生命周期。
@@ -62,7 +68,7 @@ docker run --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 127.0.0.1:9909:9909 \
-  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 
 # 2. 打开浏览器访问 Dashboard，导入网络配置
@@ -117,7 +123,7 @@ docker run --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 127.0.0.1:9909:9909 \
-  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 
 # 可选 host 网络：Web 显式绑定回环地址，勿直接暴露管理 API
@@ -127,7 +133,7 @@ docker run --name yat-client \
   --device /dev/net/tun \
   --network host \
   -e YAT_LISTEN=127.0.0.1:9909 \
-  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 ```
 
@@ -140,7 +146,7 @@ docker run --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 127.0.0.1:8080:8080 \
-  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest \
   serve --listen 0.0.0.0:8080
 ```
@@ -154,7 +160,7 @@ docker run --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 127.0.0.1:9909:9909 \
-  -v ~/.config/yat-cli:/root/.config/yat-cli \
+  -v ~/.config/yat:/root/.config/yat \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 ```
 
@@ -248,16 +254,16 @@ sudo yat-client status
 - 5 秒自动刷新状态数据
 - 支持无配置启动 — 先启动 Dashboard，再通过 Web 界面导入配置
 - 证书到期自动监控 — 每小时检查，临近过期时显示提醒
-- 断线自动重连 — 指数退避策略，最多重试 10 次后进入 30 分钟等待
+- 断线自动重连 — 指数退避，当前源码持续重试且等待上限为 30 秒（旧版失败 10 次后等待 30 分钟）
 
 ---
 
 ## 配置说明
 
-配置文件存储在 `~/.config/yat-cli/` 目录下：
+配置文件存储在 `~/.config/yat/` 目录下：
 
 ```
-~/.config/yat-cli/
+~/.config/yat/
 ├── config.json   # 主配置文件（Edge 连接 + 设备身份 + 网络配置）
 ├── device-id     # 本地设备 ID（稳定，跨导入不变）
 ├── yat-fe-linux.lock # 永久锁文件，运行中不得删除
@@ -290,7 +296,7 @@ Dockerfile 支持 Alpine 3.20（musl）和 Debian bookworm（gnu）变体；gnu 
 A: Linux 使用内核 WireGuard，需要创建 WG 网络接口并配置地址/路由，因此需要目标网络命名空间的 root 或 CAP_NET_ADMIN。
 
 **Q: Docker 容器重启后配置丢失？**  
-A: 请挂载持久化卷 `-v ~/.config/yat-cli:/root/.config/yat-cli`。
+A: 请挂载持久化卷 `-v ~/.config/yat:/root/.config/yat`。
 
 **Q: 证书过期了怎么办？**
 A: 从桌面端重新导出新的分享包（完整证书模式或令牌模式），导入后自动更新证书。

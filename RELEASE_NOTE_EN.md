@@ -8,6 +8,12 @@ The YAT Linux Server client (`yat-client`, directory `yat-fe-linux`) is a standa
 
 ## Changelog
 
+### Edge restart recovery / Unreleased (2026-10-26)
+
+- Transport loss, connection errors and control request timeouts recover through the existing supervisor: drain the old instance, authenticate and rejoin, then restore network and path responder subscriptions while preserving pair settings.
+- Retry waits are 2, 4, 8, 16 and 30 seconds, capped at 30 seconds for subsequent attempts. Removed the 30-minute cooldown after ten failures. TCP/TLS setup has a 10-second deadline and authentication a 30-second deadline; native operations retain their existing drain requirements.
+- Authorization/coordination rejections and native errors alone do not trigger rejoining. Recovery logs and the Web retry deadline remain available. Local regressions do not replace real Edge restart acceptance; see [Code Plan §11](../docs/wireguard/WIREGUARD_LINUX_RESPONDER_CODE_PLAN_2026-10-24.md#11-edge-重启后的自动恢复修正2026-10-26).
+
 ### Current source / Unreleased (2026-10-19)
 
 - Server `start/serve/leave/import` and Web operations use the same `client_owner`. A permanent lock file and private `yat-fe-linux.sock` prevent a second native configuration writer for the same directory. Desktop Linux does not use this Server IPC/Docker lifecycle.
@@ -62,7 +68,7 @@ docker run --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 127.0.0.1:9909:9909 \
-  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 
 # 2. Open the Dashboard in your browser
@@ -117,7 +123,7 @@ docker run --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 127.0.0.1:9909:9909 \
-  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 
 # Optional host networking: bind Web to loopback; do not expose the management API directly
@@ -127,7 +133,7 @@ docker run --name yat-client \
   --device /dev/net/tun \
   --network host \
   -e YAT_LISTEN=127.0.0.1:9909 \
-  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 ```
 
@@ -140,7 +146,7 @@ docker run --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 127.0.0.1:8080:8080 \
-  --mount type=volume,src=yat-client-config,dst=/root/.config/yat-cli \
+  --mount type=volume,src=yat-client-config,dst=/root/.config/yat \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest \
   serve --listen 0.0.0.0:8080
 ```
@@ -154,7 +160,7 @@ docker run --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   -p 127.0.0.1:9909:9909 \
-  -v ~/.config/yat-cli:/root/.config/yat-cli \
+  -v ~/.config/yat:/root/.config/yat \
   registry.cn-beijing.aliyuncs.com/pei/yat-fe-linux:latest
 ```
 
@@ -248,16 +254,16 @@ After starting the `serve` command, a feature-rich Web Dashboard is available in
 - Auto-refresh status data every 5 seconds
 - Zero-config startup — launch the Dashboard first, then import config via the Web UI
 - Automatic certificate monitoring — checks hourly, shows a reminder when nearing expiry
-- Auto-reconnect on disconnect — exponential backoff strategy, up to 10 retries before entering a 30-minute cooldown
+- Auto-reconnect on disconnect — exponential backoff with continuous retries and waits capped at 30 seconds in current source (older versions waited 30 minutes after ten failures)
 
 ---
 
 ## Configuration
 
-Configuration files are stored in `~/.config/yat-cli/`:
+Configuration files are stored in `~/.config/yat/`:
 
 ```
-~/.config/yat-cli/
+~/.config/yat/
 ├── config.json   # Main config (Edge connection + device identity + network config)
 ├── device-id     # Local device ID (stable across re-imports)
 ├── yat-fe-linux.lock # Permanent lock file; do not remove while running
@@ -290,7 +296,7 @@ The Dockerfile supports Alpine 3.20 (musl) and Debian bookworm (gnu) variants; t
 A: Linux uses kernel WireGuard. Creating WG interfaces and configuring addresses/routes requires root or CAP_NET_ADMIN in the target network namespace.
 
 **Q: Configuration lost after container restart?**  
-A: Mount a persistent volume with `-v ~/.config/yat-cli:/root/.config/yat-cli`.
+A: Mount a persistent volume with `-v ~/.config/yat:/root/.config/yat`.
 
 **Q: What if the certificate expires?**
 A: Re-export a new share package (full certificate mode or token mode) from the desktop app and import it — the certificate will be updated automatically.

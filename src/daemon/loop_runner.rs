@@ -27,6 +27,7 @@ pub struct PeerInfo {
   pub presence_status: u8,
   /// Handshake with the carrying peer (the relay for a Relay path).
   pub last_handshake_at: Option<f64>,
+  pub link_health: Option<yat_network::wg::peer_link_health::PeerLinkHealth>,
 }
 
 /// A single log entry for the dashboard log viewer.

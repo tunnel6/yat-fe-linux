@@ -22,6 +22,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+  /// Pair this device with a standalone Edge (without joining a network)
+  Pair {
+    #[arg(long)]
+    edge: String,
+    #[arg(long)]
+    token: String,
+  },
   /// Import a shared network package from the desktop UI
   Import {
     /// Path to the share.json file
@@ -52,7 +59,7 @@ fn main() -> anyhow::Result<()> {
   // notifies the same supervisor; native cleanup stays on the original runtime.
   if matches!(
     cli.command,
-    Commands::Start | Commands::Serve { .. } | Commands::Leave | Commands::Import { .. }
+    Commands::Start | Commands::Serve { .. } | Commands::Leave | Commands::Import { .. } | Commands::Pair { .. }
   ) {
     unsafe {
       let mut set: libc::sigset_t = std::mem::zeroed();
@@ -74,10 +81,14 @@ fn main() -> anyhow::Result<()> {
   rt.block_on(async {
     // Initialize tracing
     fmt()
-      .with_env_filter(EnvFilter::from_default_env().add_directive("yat_cli=info".parse()?))
+      .with_env_filter(
+        EnvFilter::try_from_default_env()
+          .unwrap_or_else(|_| EnvFilter::new("warn,yat_client=info,yat_network=info")),
+      )
       .init();
 
     match cli.command {
+      Commands::Pair { edge, token } => cli::pair::run(edge, token).await,
       Commands::Import { file } => cli::import::run(&file).await,
       Commands::Start => cli::start::run().await,
       Commands::Status => cli::status::run(),

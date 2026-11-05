@@ -15,8 +15,10 @@ use tokio::sync::{mpsc, oneshot, watch, Notify};
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
   Start {},
+  Reconnect {},
   Leave {},
   Import { content: String },
+  Pair { edge: String, token: String },
   UpdateAddress { new_ip: String },
 }
 
