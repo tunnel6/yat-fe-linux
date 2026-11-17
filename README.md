@@ -18,7 +18,7 @@ docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   --net host \
-  ghcr.io/tunnel6/yat-client-linux:latest yat-client serve
+  ghcr.io/tunnel6/yat-client-linux:latest
 
 # 2. Open the Dashboard in your browser
 #    http://<your-linux-ip>:9909
