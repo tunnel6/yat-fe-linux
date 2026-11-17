@@ -18,7 +18,7 @@ docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   --net host \
-  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0 yat-client serve
+  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0
 
 # 2. 打开浏览器访问 Dashboard，导入网络配置
 #    http://<your-linux-ip>:9909
@@ -97,7 +97,7 @@ docker run -d --name yat-client \
   --cap-add NET_ADMIN \
   --device /dev/net/tun \
   --net host \
-  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0 yat-client serve
+  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0
 ```
 
 #### 自定义端口
@@ -129,7 +129,7 @@ docker run -d --name yat-client \
   --device /dev/net/tun \
   --net host \
   -v ~/.config/yat-cli:/root/.config/yat-cli \
-  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0 yat-client serve
+  registry.cn-beijing.aliyuncs.com/pei/yat-client-linux:1.0.0
 ```
 
 #### 查看日志
